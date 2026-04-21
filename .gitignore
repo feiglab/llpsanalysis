@@ -1,0 +1,9 @@
+.git
+.ipynb_checkpoints
+src/__pycache__
+src/bmc/__pycache__
+__pycache__
+*.egg-info/
+src/*.egg-info/
+**/*.egg-info/
+data

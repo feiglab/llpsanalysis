@@ -1,0 +1,6 @@
+matplotlib>=3.10
+scipy>=1.16
+numpy>=2.0
+pandas>=2.2
+mdtraj>=1.11
+mdsim @ git+https://github.com/feiglab/mdsim.git
