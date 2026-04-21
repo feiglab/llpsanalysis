@@ -6,7 +6,23 @@ from typing import Any
 
 import numpy as np
 
-_FILE_RE_TEMPLATE = r"^r(?P<replica>\d+),p(?P<peptide>\d+)\.{tag}$"
+_FILE_RE_TEMPLATE = r"^r(?P<replica>\d+).p(?P<peptide>\d+)\.{tag}$"
+
+
+def _resolve_aux_file(directory: str | Path, filename: str) -> Path:
+    base = Path(directory)
+    if not base.is_dir():
+        raise FileNotFoundError(f"directory does not exist: {base}")
+
+    direct = base / filename
+    if direct.is_file():
+        return direct
+
+    results = base / "results" / filename
+    if results.is_file():
+        return results
+
+    raise FileNotFoundError(f"file '{filename}' not found in {base} or {base / 'results'}")
 
 
 def read_ascii_timeseries(
@@ -45,20 +61,12 @@ def read_ascii_timeseries(
           - "values": ndarray, shape (n_peptides, n_values, n_frames)
           - "time_ns": ndarray, shape (n_frames,)
           - "peptides": ndarray, shape (n_peptides,)
-
-    Raises
-    ------
-    FileNotFoundError
-        If no matching files are found.
-    ValueError
-        If files have too few columns, inconsistent time arrays within a
-        replica, or inconsistent numbers of value columns within a replica.
     """
     if stride < 1:
         raise ValueError(f"stride must be >= 1, got {stride}")
 
-    base_dir = _resolve_data_dir(directory)
     pattern = re.compile(_FILE_RE_TEMPLATE.format(tag=re.escape(tag)))
+    base_dir = _resolve_data_dir(directory, pattern)
 
     files_by_replica: dict[int, dict[int, Path]] = {}
     for path in sorted(base_dir.iterdir()):
@@ -107,11 +115,9 @@ def read_ascii_timeseries(
                         f"{replica}: expected {n_value_cols_ref}, got "
                         f"{values.shape[1]} for peptide {peptide} in {path}"
                     )
-                if time_ref.shape != time_ns.shape or not np.allclose(
+                if time_ref.shape != time_ns.shape or not np.array_equal(
                     time_ref,
                     time_ns,
-                    rtol=0.0,
-                    atol=0.0,
                 ):
                     raise ValueError(
                         "inconsistent time grid within replica "
@@ -135,20 +141,28 @@ def read_ascii_timeseries(
     return out
 
 
-def _resolve_data_dir(directory: str | Path) -> Path:
+def _resolve_data_dir(directory: str | Path, pattern: re.Pattern[str]) -> Path:
     base = Path(directory)
-    if not base.exists():
+    if not base.is_dir():
         raise FileNotFoundError(f"directory does not exist: {base}")
 
-    direct_files = [p for p in base.iterdir() if p.is_file()]
-    if direct_files:
+    if _has_matching_files(base, pattern):
         return base
 
     results_dir = base / "results"
-    if results_dir.is_dir():
+    if results_dir.is_dir() and _has_matching_files(results_dir, pattern):
         return results_dir
 
-    return base
+    raise FileNotFoundError(
+        f"no files matching pattern '{pattern.pattern}' found in " f"{base} or {results_dir}"
+    )
+
+
+def _has_matching_files(directory: Path, pattern: re.Pattern[str]) -> bool:
+    for path in directory.iterdir():
+        if path.is_file() and pattern.match(path.name):
+            return True
+    return False
 
 
 def _read_one_file(
@@ -184,3 +198,107 @@ def _read_one_file(
         values = values[::stride]
 
     return time_ns, values
+
+
+def subset_peptides(
+    data: dict[int, dict[str, Any]],
+    peptide_indices: list[int] | range | np.ndarray,
+) -> dict[int, dict[str, Any]]:
+    """
+    Extract a peptide subset from the output of `read_ascii_timeseries`.
+
+    Parameters
+    ----------
+    data
+        Output from `read_ascii_timeseries`.
+    peptide_indices
+        Peptide indices to keep, e.g. `range(1, 14)` or `[1, 2, 3]`.
+
+    Returns
+    -------
+    dict[int, dict[str, Any]]
+        Same structure as input, but with only the selected peptides.
+
+    Raises
+    ------
+    ValueError
+        If any requested peptide index is missing for a replica.
+    """
+    requested = np.array(list(peptide_indices), dtype=int)
+    out: dict[int, dict[str, Any]] = {}
+
+    for replica, replica_data in sorted(data.items()):
+        peptides = np.asarray(replica_data["peptides"], dtype=int)
+        values = np.asarray(replica_data["values"])
+        time_ns = np.asarray(replica_data["time_ns"])
+
+        index_map = {pep: i for i, pep in enumerate(peptides)}
+        missing = [pep for pep in requested if pep not in index_map]
+        if missing:
+            raise ValueError(f"replica {replica} is missing requested peptides: {missing}")
+
+        sel = np.array([index_map[pep] for pep in requested], dtype=int)
+
+        out[replica] = {
+            "values": values[sel, :, :],
+            "time_ns": time_ns.copy(),
+            "peptides": peptides[sel],
+        }
+
+    return out
+
+
+def read_peptide_indices_from_segments(
+    directory: str | Path,
+    filename: str,
+) -> list[int]:
+    """
+    Read peptide indices from a segment file.
+
+    The file is searched first in `directory`, then in `directory / "results"`.
+
+    Segment names are expected to look like:
+      - P000
+      - P001
+      - P002
+
+    They are converted to 1-based peptide indices:
+      - P000 -> 1
+      - P001 -> 2
+      - P002 -> 3
+
+    Parameters
+    ----------
+    directory
+        Base directory for the dataset.
+    filename
+        Segment file name, e.g. "rlp.seg".
+
+    Returns
+    -------
+    list[int]
+        Peptide indices in the order found in the file.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the file is not found.
+    ValueError
+        If no segment names are found or if a token has invalid format.
+    """
+    path = _resolve_aux_file(directory, filename)
+
+    text = path.read_text(encoding="utf-8")
+    tokens = text.split()
+
+    peptide_indices: list[int] = []
+    for token in tokens:
+        match = re.fullmatch(r"P(\d+)", token)
+        if match is None:
+            continue
+        peptide_indices.append(int(match.group(1)) + 1)
+
+    if not peptide_indices:
+        raise ValueError(f"no segment names like 'P000' found in {path}")
+
+    return peptide_indices
