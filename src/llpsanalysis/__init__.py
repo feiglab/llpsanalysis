@@ -1,3 +1,3 @@
 from __future__ import annotations
 
-from .llpsanalysis import *  # noqa: F403
+from llpsanalysis import *  # noqa: F403
