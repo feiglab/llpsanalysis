@@ -108,22 +108,19 @@ def read_ascii_timeseries(
         if peptide in files_by_replica[replica]:
             prev = files_by_replica[replica][peptide]
             raise ValueError(
-                f"duplicate file for replica {replica}, peptide {peptide}: "
-                f"{prev} and {path}"
+                f"duplicate file for replica {replica}, peptide {peptide}: " f"{prev} and {path}"
             )
 
         files_by_replica[replica][peptide] = path
 
     if not files_by_replica:
         raise FileNotFoundError(
-            f"no files matching pattern 'r?.p?.{tag}' or 'r?.{tag}' "
-            f"found in {base_dir}"
+            f"no files matching pattern 'r?.p?.{tag}' or 'r?.{tag}' " f"found in {base_dir}"
         )
 
     if has_peptide_files and has_replica_only_files:
         raise ValueError(
-            f"mixed per-peptide and replica-only files found for tag '{tag}' "
-            f"in {base_dir}"
+            f"mixed per-peptide and replica-only files found for tag '{tag}' " f"in {base_dir}"
         )
 
     out: dict[int, dict[str, Any]] = {}
@@ -177,6 +174,7 @@ def read_ascii_timeseries(
         }
 
     return out
+
 
 def _resolve_data_dir(directory: str | Path, pattern: re.Pattern[str]) -> Path:
     base = Path(directory)
@@ -340,6 +338,7 @@ def read_peptide_indices_from_segments(
 
     return peptide_indices
 
+
 def plot_histogram_with_sem(
     data: dict[int, dict[str, Any]],
     *,
@@ -376,8 +375,7 @@ def plot_histogram_with_sem(
 
         if values.ndim != 3:
             raise ValueError(
-                f"replica {replica} values must have shape "
-                "(n_peptides, n_values, n_frames)"
+                f"replica {replica} values must have shape " "(n_peptides, n_values, n_frames)"
             )
 
         if value_index < 0 or value_index >= values.shape[1]:
@@ -393,9 +391,7 @@ def plot_histogram_with_sem(
             index_map = {pep: i for i, pep in enumerate(peptides)}
             missing = [pep for pep in requested if pep not in index_map]
             if missing:
-                raise ValueError(
-                    f"replica {replica} is missing requested peptides: {missing}"
-                )
+                raise ValueError(f"replica {replica} is missing requested peptides: {missing}")
             sel = np.array([index_map[pep] for pep in requested], dtype=int)
 
         replica_values = values[sel, value_index, :].reshape(-1)
@@ -498,9 +494,7 @@ def calculate_mean_sem(
             index_map = {pep: i for i, pep in enumerate(peptides)}
             missing = [pep for pep in requested if pep not in index_map]
             if missing:
-                raise ValueError(
-                    f"replica {replica} is missing requested peptides: {missing}"
-                )
+                raise ValueError(f"replica {replica} is missing requested peptides: {missing}")
             sel = np.array([index_map[pep] for pep in requested], dtype=int)
 
         replica_mean = values[sel, value_index, :].mean()
@@ -510,9 +504,7 @@ def calculate_mean_sem(
     mean = float(per_replica_arr.mean())
 
     if per_replica_arr.shape[0] > 1:
-        sem = float(
-            per_replica_arr.std(ddof=1) / np.sqrt(per_replica_arr.shape[0])
-        )
+        sem = float(per_replica_arr.std(ddof=1) / np.sqrt(per_replica_arr.shape[0]))
     else:
         sem = 0.0
 
@@ -522,6 +514,7 @@ def calculate_mean_sem(
         "per_replica": per_replica_arr,
         "replicas": np.array(replica_ids, dtype=int),
     }
+
 
 def calculate_msd_curves(
     data: dict[int, dict[str, Any]],
@@ -579,15 +572,12 @@ def calculate_msd_curves(
 
         if values.ndim != 3:
             raise ValueError(
-                f"replica {replica} values must have shape "
-                "(n_peptides, n_values, n_frames)"
+                f"replica {replica} values must have shape " "(n_peptides, n_values, n_frames)"
             )
 
         n_peptides, n_values, n_frames = values.shape
         if n_frames < 2:
-            raise ValueError(
-                f"replica {replica} must contain at least two frames"
-            )
+            raise ValueError(f"replica {replica} must contain at least two frames")
 
         for idx in coord_indices:
             if idx < 0 or idx >= n_values:
@@ -604,9 +594,7 @@ def calculate_msd_curves(
             index_map = {pep: i for i, pep in enumerate(peptides)}
             missing = [pep for pep in requested if pep not in index_map]
             if missing:
-                raise ValueError(
-                    f"replica {replica} is missing requested peptides: {missing}"
-                )
+                raise ValueError(f"replica {replica} is missing requested peptides: {missing}")
             sel = np.array([index_map[pep] for pep in requested], dtype=int)
             selected_peptides = peptides[sel]
 
@@ -637,6 +625,7 @@ def calculate_msd_curves(
 
     return out
 
+
 def calculate_msd_curves_fft(
     data: dict[int, dict[str, Any]],
     *,
@@ -661,15 +650,12 @@ def calculate_msd_curves_fft(
 
         if values.ndim != 3:
             raise ValueError(
-                f"replica {replica} values must have shape "
-                "(n_peptides, n_values, n_frames)"
+                f"replica {replica} values must have shape " "(n_peptides, n_values, n_frames)"
             )
 
         n_peptides, n_values, n_frames = values.shape
         if n_frames < 2:
-            raise ValueError(
-                f"replica {replica} must contain at least two frames"
-            )
+            raise ValueError(f"replica {replica} must contain at least two frames")
 
         for idx in coord_indices:
             if idx < 0 or idx >= n_values:
@@ -686,9 +672,7 @@ def calculate_msd_curves_fft(
             index_map = {pep: i for i, pep in enumerate(peptides)}
             missing = [pep for pep in requested if pep not in index_map]
             if missing:
-                raise ValueError(
-                    f"replica {replica} is missing requested peptides: {missing}"
-                )
+                raise ValueError(f"replica {replica} is missing requested peptides: {missing}")
             sel = np.array([index_map[pep] for pep in requested], dtype=int)
             selected_peptides = peptides[sel]
 
@@ -794,9 +778,7 @@ def calculate_diffusion_constants(
 
     tmin, tmax = fit_range_ns
     if tmin >= tmax:
-        raise ValueError(
-            f"fit_range_ns must satisfy tmin < tmax, got {fit_range_ns}"
-        )
+        raise ValueError(f"fit_range_ns must satisfy tmin < tmax, got {fit_range_ns}")
 
     out: dict[int, dict[str, np.ndarray]] = {}
 
@@ -807,13 +789,11 @@ def calculate_diffusion_constants(
 
         if lag_time_ns.ndim != 1:
             raise ValueError(
-                f"replica {replica} lag_time_ns must be 1D, got "
-                f"{lag_time_ns.ndim}D"
+                f"replica {replica} lag_time_ns must be 1D, got " f"{lag_time_ns.ndim}D"
             )
         if msd.ndim != 2:
             raise ValueError(
-                f"replica {replica} msd must have shape "
-                f"(n_peptides, n_lags), got {msd.shape}"
+                f"replica {replica} msd must have shape " f"(n_peptides, n_lags), got {msd.shape}"
             )
         if msd.shape[1] != lag_time_ns.shape[0]:
             raise ValueError(
@@ -851,6 +831,7 @@ def calculate_diffusion_constants(
         }
 
     return out
+
 
 def average_over_peptides(
     data: dict[int, dict[str, np.ndarray]],
@@ -901,21 +882,15 @@ def average_over_peptides(
         replica_data = data[replica]
 
         if key not in replica_data:
-            raise ValueError(
-                f"replica {replica} does not contain key '{key}'"
-            )
+            raise ValueError(f"replica {replica} does not contain key '{key}'")
 
         peptides = np.asarray(replica_data["peptides"], dtype=int)
         values = np.asarray(replica_data[key], dtype=float)
 
         if peptides.ndim != 1:
-            raise ValueError(
-                f"replica {replica} peptides must be 1D, got {peptides.ndim}D"
-            )
+            raise ValueError(f"replica {replica} peptides must be 1D, got {peptides.ndim}D")
         if values.ndim != 1:
-            raise ValueError(
-                f"replica {replica} '{key}' must be 1D, got {values.ndim}D"
-            )
+            raise ValueError(f"replica {replica} '{key}' must be 1D, got {values.ndim}D")
         if peptides.shape[0] != values.shape[0]:
             raise ValueError(
                 f"replica {replica} has inconsistent peptide/{key} shapes: "
@@ -930,18 +905,14 @@ def average_over_peptides(
             index_map = {pep: i for i, pep in enumerate(peptides)}
             missing = [pep for pep in requested if pep not in index_map]
             if missing:
-                raise ValueError(
-                    f"replica {replica} is missing requested peptides: {missing}"
-                )
+                raise ValueError(f"replica {replica} is missing requested peptides: {missing}")
             sel = np.array([index_map[pep] for pep in requested], dtype=int)
             selected_peptides = peptides[sel]
 
         if peptide_ref is None:
             peptide_ref = selected_peptides.copy()
         elif not np.array_equal(peptide_ref, selected_peptides):
-            raise ValueError(
-                f"inconsistent peptide selection/order in replica {replica}"
-            )
+            raise ValueError(f"inconsistent peptide selection/order in replica {replica}")
 
         per_replica.append(float(np.mean(values[sel])))
 
@@ -950,9 +921,7 @@ def average_over_peptides(
     mean = float(np.mean(per_replica_arr))
 
     if per_replica_arr.shape[0] > 1:
-        sem = float(
-            np.std(per_replica_arr, ddof=1) / np.sqrt(per_replica_arr.shape[0])
-        )
+        sem = float(np.std(per_replica_arr, ddof=1) / np.sqrt(per_replica_arr.shape[0]))
     else:
         sem = 0.0
 
@@ -1073,9 +1042,7 @@ def correct_diffusion_pbc(
     if len(box_indices) != 3:
         raise ValueError("box_indices must contain exactly three indices")
     if box_mode not in {"xyz", "xy", "x", "y", "z"}:
-        raise ValueError(
-            f"box_mode must be one of 'xyz', 'xy', 'x', 'y', 'z', got {box_mode}"
-        )
+        raise ValueError(f"box_mode must be one of 'xyz', 'xy', 'x', 'y', 'z', got {box_mode}")
 
     out: dict[int, dict[str, np.ndarray]] = {}
     k_b = 1.380649e-23
@@ -1085,21 +1052,15 @@ def correct_diffusion_pbc(
         if replica not in box_data:
             raise ValueError(f"box_data is missing replica {replica}")
         if d_key not in replica_data:
-            raise ValueError(
-                f"replica {replica} does not contain key '{d_key}'"
-            )
+            raise ValueError(f"replica {replica} does not contain key '{d_key}'")
 
         peptides = np.asarray(replica_data["peptides"], dtype=int)
         dvals = np.asarray(replica_data[d_key], dtype=float)
 
         if peptides.ndim != 1:
-            raise ValueError(
-                f"replica {replica} peptides must be 1D, got {peptides.ndim}D"
-            )
+            raise ValueError(f"replica {replica} peptides must be 1D, got {peptides.ndim}D")
         if dvals.ndim != 1:
-            raise ValueError(
-                f"replica {replica} '{d_key}' must be 1D, got {dvals.ndim}D"
-            )
+            raise ValueError(f"replica {replica} '{d_key}' must be 1D, got {dvals.ndim}D")
         if peptides.shape[0] != dvals.shape[0]:
             raise ValueError(
                 f"replica {replica} has inconsistent peptide/{d_key} shapes: "
@@ -1114,9 +1075,7 @@ def correct_diffusion_pbc(
 
         conc_gl = _replica_scalar_value(concentration_gl, replica)
         if conc_gl < 0.0:
-            raise ValueError(
-                f"concentration must be >= 0, got {conc_gl} for replica {replica}"
-            )
+            raise ValueError(f"concentration must be >= 0, got {conc_gl} for replica {replica}")
 
         phi = conc_gl / 1430.0
         fvisc = 1.0 + 2.5 * phi + b * phi * phi
@@ -1152,6 +1111,7 @@ def correct_diffusion_pbc(
 
     return out
 
+
 def _box_length_from_timeseries(
     replica_box_data: dict[int, Any],
     *,
@@ -1162,8 +1122,7 @@ def _box_length_from_timeseries(
 
     if values.ndim != 3:
         raise ValueError(
-            "box values must have shape (n_peptides, n_values, n_frames), got "
-            f"{values.shape}"
+            "box values must have shape (n_peptides, n_values, n_frames), got " f"{values.shape}"
         )
 
     if values.shape[0] != 1:
@@ -1177,8 +1136,7 @@ def _box_length_from_timeseries(
     for idx in (ix, iy, iz):
         if idx < 0 or idx >= n_values:
             raise ValueError(
-                f"box index {idx} out of range; available indices: "
-                f"0..{n_values - 1}"
+                f"box index {idx} out of range; available indices: " f"0..{n_values - 1}"
             )
 
     lx = values[0, ix, :]
@@ -1212,6 +1170,7 @@ def _replica_scalar_value(
         return float(value[replica])
 
     return float(value)
+
 
 def plot_msd_by_replica(
     msd_data: dict[int, dict[str, np.ndarray]],
@@ -1258,18 +1217,13 @@ def plot_msd_by_replica(
         msd = np.asarray(replica_data["msd"], dtype=float)
 
         if peptides.ndim != 1:
-            raise ValueError(
-                f"replica {replica} peptides must be 1D, got {peptides.ndim}D"
-            )
+            raise ValueError(f"replica {replica} peptides must be 1D, got {peptides.ndim}D")
         if lag_time_ns.ndim != 1:
             raise ValueError(
-                f"replica {replica} lag_time_ns must be 1D, got "
-                f"{lag_time_ns.ndim}D"
+                f"replica {replica} lag_time_ns must be 1D, got " f"{lag_time_ns.ndim}D"
             )
         if msd.ndim != 2:
-            raise ValueError(
-                f"replica {replica} msd must be 2D, got {msd.ndim}D"
-            )
+            raise ValueError(f"replica {replica} msd must be 2D, got {msd.ndim}D")
         if msd.shape != (peptides.shape[0], lag_time_ns.shape[0]):
             raise ValueError(
                 f"replica {replica} has inconsistent shapes: "
@@ -1285,9 +1239,7 @@ def plot_msd_by_replica(
             index_map = {pep: i for i, pep in enumerate(peptides)}
             missing = [pep for pep in requested if pep not in index_map]
             if missing:
-                raise ValueError(
-                    f"replica {replica} is missing requested peptides: {missing}"
-                )
+                raise ValueError(f"replica {replica} is missing requested peptides: {missing}")
             sel = np.array([index_map[pep] for pep in requested], dtype=int)
             selected_peptides = peptides[sel]
 
@@ -1305,9 +1257,7 @@ def plot_msd_by_replica(
         msd_sel = msd[sel][:, mask]
 
         if lag_time_sel.size == 0:
-            raise ValueError(
-                f"replica {replica} has no lag times in range {time_range_ns}"
-            )
+            raise ValueError(f"replica {replica} has no lag times in range {time_range_ns}")
 
         for i, peptide in enumerate(selected_peptides):
             ax.plot(lag_time_sel, msd_sel[i], label=f"P{peptide:03d}")
@@ -1401,9 +1351,7 @@ def read_density_profile_timeseries(
           - "values": ndarray, shape (n_records, n_bins)
           - "records": list of raw record dicts
     """
-    pattern = re.compile(
-        rf"^r(?P<replica>\d+)\.(?P<suffix>{re.escape(profile_suffix)})$"
-    )
+    pattern = re.compile(rf"^r(?P<replica>\d+)\.(?P<suffix>{re.escape(profile_suffix)})$")
     base_dir = _resolve_data_dir(directory, pattern)
 
     length_scale = 0.1 if angstrom_to_nm else 1.0
@@ -1430,8 +1378,7 @@ def read_density_profile_timeseries(
 
                 if len(fields) < 6:
                     raise ValueError(
-                        f"{path}:{line_no} has too few columns for "
-                        "density-profile data"
+                        f"{path}:{line_no} has too few columns for " "density-profile data"
                     )
 
                 time_ns = float(fields[0])
@@ -1495,6 +1442,7 @@ def read_density_profile_timeseries(
         "angstrom_to_nm": angstrom_to_nm,
     }
 
+
 def select_density_profile_time(
     profile_data: dict[str, Any],
     time_ns: float,
@@ -1537,9 +1485,7 @@ def select_density_profile_time(
     mask = np.abs(times - time_ns) <= time_tol_ns
 
     if not np.any(mask):
-        raise ValueError(
-            f"no profile records found at time {time_ns} +/- {time_tol_ns} ns"
-        )
+        raise ValueError(f"no profile records found at time {time_ns} +/- {time_tol_ns} ns")
 
     replicas = np.asarray(profile_data["replicas"], dtype=int)[mask]
     xmin = np.asarray(profile_data["xmin"], dtype=float)[mask]
@@ -1637,13 +1583,9 @@ def plot_density_profiles(
     n_sets = len(datasets)
 
     if labels is not None and len(labels) != n_sets:
-        raise ValueError(
-            f"labels must have length {n_sets}, got {len(labels)}"
-        )
+        raise ValueError(f"labels must have length {n_sets}, got {len(labels)}")
     if colors is not None and len(colors) != n_sets:
-        raise ValueError(
-            f"colors must have length {n_sets}, got {len(colors)}"
-        )
+        raise ValueError(f"colors must have length {n_sets}, got {len(colors)}")
 
     if ax is None:
         fig, ax = plt.subplots()
@@ -1686,5 +1628,3 @@ def plot_density_profiles(
         fig.savefig(save_path, bbox_inches="tight")
 
     return fig, ax
-
-
