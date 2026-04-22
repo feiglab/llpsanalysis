@@ -1446,20 +1446,17 @@ def read_density_profile_timeseries(
 def select_density_profile_time(
     profile_data: dict[str, Any],
     time_ns: float,
-    *,
-    time_tol_ns: float = 0.1,
 ) -> dict[str, Any]:
     """
-    Select profile records near a given time and compute mean, std, and SEM.
+    Select the profile records at the closest available time point and compute
+    mean, std, and SEM.
 
     Parameters
     ----------
     profile_data
         Output from `read_density_profile_timeseries()`.
     time_ns
-        Target time to extract.
-    time_tol_ns
-        Allowed absolute deviation from `time_ns`.
+        Target time in ns.
 
     Returns
     -------
@@ -1467,8 +1464,8 @@ def select_density_profile_time(
         Dictionary with:
           - "directory"
           - "profile_suffix"
-          - "time_ns"
-          - "time_tol_ns"
+          - "time_ns_requested"
+          - "time_ns_selected"
           - "replicas"
           - "x"
           - "mean"
@@ -1479,13 +1476,17 @@ def select_density_profile_time(
     Raises
     ------
     ValueError
-        If no matching records are found or grids are inconsistent.
+        If the selected profile records have inconsistent grids.
     """
     times = np.asarray(profile_data["time_ns"], dtype=float)
-    mask = np.abs(times - time_ns) <= time_tol_ns
+    if times.size == 0:
+        raise ValueError("profile_data does not contain any time points")
 
-    if not np.any(mask):
-        raise ValueError(f"no profile records found at time {time_ns} +/- {time_tol_ns} ns")
+    unique_times = np.unique(times)
+    itime = int(np.argmin(np.abs(unique_times - time_ns)))
+    selected_time = float(unique_times[itime])
+
+    mask = times == selected_time
 
     replicas = np.asarray(profile_data["replicas"], dtype=int)[mask]
     xmin = np.asarray(profile_data["xmin"], dtype=float)[mask]
@@ -1517,8 +1518,8 @@ def select_density_profile_time(
     return {
         "directory": profile_data["directory"],
         "profile_suffix": profile_data["profile_suffix"],
-        "time_ns": float(time_ns),
-        "time_tol_ns": float(time_tol_ns),
+        "time_ns_requested": float(time_ns),
+        "time_ns_selected": selected_time,
         "replicas": replicas,
         "x": x,
         "mean": mean,
@@ -1628,3 +1629,72 @@ def plot_density_profiles(
         fig.savefig(save_path, bbox_inches="tight")
 
     return fig, ax
+
+
+def average_density_over_range(
+    profile_data: dict[str, Any],
+    z_range: tuple[float, float],
+) -> dict[str, Any]:
+    """
+    Average density over a selected z range.
+
+    Parameters
+    ----------
+    profile_data
+        Output from `select_density_profile_time()`.
+    z_range
+        Interval `(zmin, zmax)` over which to average the density.
+
+    Returns
+    -------
+    dict[str, Any]
+        Dictionary with:
+          - "z_range": ndarray, shape (2,)
+          - "mean": float
+          - "sem": float
+          - "std": float
+          - "per_replica": ndarray, shape (n_replicas,)
+          - "replicas": ndarray, shape (n_replicas,)
+
+    Raises
+    ------
+    ValueError
+        If the z range is invalid or contains no bins.
+    """
+    zmin, zmax = z_range
+    if zmin >= zmax:
+        raise ValueError(f"z_range must satisfy zmin < zmax, got {z_range}")
+
+    x = np.asarray(profile_data["x"], dtype=float)
+    per_replica = np.asarray(profile_data["per_replica"], dtype=float)
+    replicas = np.asarray(profile_data["replicas"], dtype=int)
+
+    if x.ndim != 1:
+        raise ValueError(f"profile_data['x'] must be 1D, got {x.ndim}D")
+    if per_replica.ndim != 2:
+        raise ValueError(f"profile_data['per_replica'] must be 2D, got {per_replica.ndim}D")
+    if per_replica.shape[1] != x.shape[0]:
+        raise ValueError(f"inconsistent shapes: x={x.shape}, per_replica={per_replica.shape}")
+
+    mask = (x >= zmin) & (x <= zmax)
+    if not np.any(mask):
+        raise ValueError(f"no profile bins found in z range {z_range}")
+
+    per_replica_avg = np.mean(per_replica[:, mask], axis=1)
+    mean = float(np.mean(per_replica_avg))
+
+    if per_replica_avg.shape[0] > 1:
+        std = float(np.std(per_replica_avg, ddof=1))
+        sem = float(std / np.sqrt(per_replica_avg.shape[0]))
+    else:
+        std = 0.0
+        sem = 0.0
+
+    return {
+        "z_range": np.array([zmin, zmax], dtype=float),
+        "mean": mean,
+        "sem": sem,
+        "std": std,
+        "per_replica": per_replica_avg,
+        "replicas": replicas,
+    }
