@@ -272,6 +272,104 @@ class ReconfigurationTimeResult:
     def acceptance_fraction(self) -> float:
         return self.n_accepted / self.n_fitted if self.n_fitted else float("nan")
 
+    def _double_component_per_chain(self, field: str) -> np.ndarray:
+        """Mean one fitted biexponential parameter over sites within each chain.
+
+        Only accepted double-exponential fits with finite fast/slow times and
+        fractions are included. For torsions, the overall-summary residue policy
+        is respected (common residues versus available residues). Each chain,
+        not each residue, is one replicate for uncertainty estimation.
+        """
+        if field not in {"tau_fast_ns", "tau_slow_ns", "fast_fraction"}:
+            raise ValueError("unknown biexponential component field")
+        values = np.full(len(self.chain_labels), np.nan, dtype=float)
+        if self.kind == "torsions" and self.residue_averaging == "common":
+            if self.residue_numbers is None or self.summary_residue_numbers is None:
+                return values
+            selected = np.isin(self.residue_numbers, self.summary_residue_numbers)
+        else:
+            selected = np.ones(self.accepted.shape[1], dtype=bool)
+        for ci, chain in enumerate(self.chain_labels):
+            per_site = []
+            for ri, fit in enumerate(self.fits[chain]):
+                if not (selected[ri] and self.accepted[ci, ri] and fit.model == "double"):
+                    continue
+                if not (
+                    np.isfinite(fit.tau_fast_ns)
+                    and np.isfinite(fit.tau_slow_ns)
+                    and np.isfinite(fit.fast_fraction)
+                ):
+                    continue
+                per_site.append(float(getattr(fit, field)))
+            if per_site:
+                values[ci] = float(np.mean(per_site))
+        return values
+
+    @staticmethod
+    def _component_stats(values: np.ndarray) -> tuple[float, float, float]:
+        """Mean, sample SD, and SEM across independent chain summaries."""
+        finite = np.asarray(values, dtype=float)
+        finite = finite[np.isfinite(finite)]
+        if not finite.size:
+            return (float("nan"), float("nan"), float("nan"))
+        mean = float(np.mean(finite))
+        if finite.size < 2:
+            return (mean, float("nan"), float("nan"))
+        sd = float(np.std(finite, ddof=1))
+        return (mean, sd, sd / math.sqrt(finite.size))
+
+    @property
+    def per_chain_tau_fast_ns(self) -> np.ndarray:
+        return self._double_component_per_chain("tau_fast_ns")
+
+    @property
+    def per_chain_tau_slow_ns(self) -> np.ndarray:
+        return self._double_component_per_chain("tau_slow_ns")
+
+    @property
+    def per_chain_fast_fraction(self) -> np.ndarray:
+        return self._double_component_per_chain("fast_fraction")
+
+    @property
+    def n_double_chains(self) -> int:
+        return int(np.isfinite(self.per_chain_tau_fast_ns).sum())
+
+    @property
+    def mean_tau_fast_ns(self) -> float:
+        return self._component_stats(self.per_chain_tau_fast_ns)[0]
+
+    @property
+    def std_tau_fast_ns(self) -> float:
+        return self._component_stats(self.per_chain_tau_fast_ns)[1]
+
+    @property
+    def sem_tau_fast_ns(self) -> float:
+        return self._component_stats(self.per_chain_tau_fast_ns)[2]
+
+    @property
+    def mean_tau_slow_ns(self) -> float:
+        return self._component_stats(self.per_chain_tau_slow_ns)[0]
+
+    @property
+    def std_tau_slow_ns(self) -> float:
+        return self._component_stats(self.per_chain_tau_slow_ns)[1]
+
+    @property
+    def sem_tau_slow_ns(self) -> float:
+        return self._component_stats(self.per_chain_tau_slow_ns)[2]
+
+    @property
+    def mean_fast_fraction(self) -> float:
+        return self._component_stats(self.per_chain_fast_fraction)[0]
+
+    @property
+    def std_fast_fraction(self) -> float:
+        return self._component_stats(self.per_chain_fast_fraction)[1]
+
+    @property
+    def sem_fast_fraction(self) -> float:
+        return self._component_stats(self.per_chain_fast_fraction)[2]
+
     def report(self, *, max_rows: Optional[int] = None) -> str:
         """Format all fitted component parameters and quality diagnostics.
 
@@ -288,6 +386,15 @@ class ReconfigurationTimeResult:
             f"mean tau = {self.mean_tau_ns:.6g} ns | "
             f"across-chain SEM = {self.sem_tau_ns:.6g} ns",
         ]
+        if self.n_double_chains:
+            lines.extend(
+                (
+                    f"Biexponential chain summaries (n={self.n_double_chains}):",
+                    f"  tau_fast = {self.mean_tau_fast_ns:.6g} +/- {self.sem_tau_fast_ns:.6g} ns (SEM)",
+                    f"  tau_slow = {self.mean_tau_slow_ns:.6g} +/- {self.sem_tau_slow_ns:.6g} ns (SEM)",
+                    f"  fast fraction = {self.mean_fast_fraction:.6g} +/- {self.sem_fast_fraction:.6g} (SEM)",
+                )
+            )
         shown = 0
         total = sum(len(items) for items in self.fits.values())
         for chain in self.chain_labels:
