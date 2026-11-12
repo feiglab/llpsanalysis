@@ -1735,11 +1735,50 @@ def _plot_scale(time_unit: str) -> tuple[float, str]:
 
 
 def _plot_items(data: Any, cls: type) -> list[tuple[str, Any]]:
+    """Accept one result, a named mapping, or an ordered sequence of results.
+
+    Sequences receive keys 'series1', 'series2', ...; corresponding fit
+    sequences must use the same order. Mapping keys are retained unchanged.
+    """
     if isinstance(data, cls):
         return [(data.dataset_label, data)]
     if isinstance(data, Mapping) and data and all(isinstance(x, cls) for x in data.values()):
         return [(str(k), v) for k, v in data.items()]
-    raise TypeError(f"expected {cls.__name__} or a nonempty flat mapping of these results")
+    if (
+        isinstance(data, Sequence)
+        and not isinstance(data, (str, bytes))
+        and data
+        and all(isinstance(x, cls) for x in data)
+    ):
+        return [(f"series{i + 1}", item) for i, item in enumerate(data)]
+    raise TypeError(
+        f"expected {cls.__name__}, a nonempty mapping of such results, "
+        "or a nonempty sequence of them"
+    )
+
+
+def _plot_style_value(
+    spec: Any,
+    key: str,
+    index: int,
+    default: Any,
+    *,
+    name: str,
+) -> Any:
+    """Select a per-dataset plotting option from a mapping or ordered list."""
+    if spec is None:
+        return default
+    if isinstance(spec, Mapping):
+        return spec.get(key, default)
+    if isinstance(spec, (str, bytes)):
+        if name == "colors":
+            return spec
+        raise TypeError(f"{name} must be a mapping or sequence, not a string")
+    if isinstance(spec, Sequence):
+        if index >= len(spec):
+            raise ValueError(f"{name} has fewer entries than plotted datasets")
+        return spec[index]
+    raise TypeError(f"{name} must be a mapping or sequence")
 
 
 def _save_plot(fig: Any, path: Any, dpi: float) -> None:
@@ -1763,7 +1802,13 @@ def plot_reconfiguration_correlations(
     yscale: str = "linear",
     xlim: Optional[tuple[float, float]] = None,
     ylim: Optional[tuple[float, float]] = None,
-    labels: Optional[Mapping[str, str]] = None,
+    labels: Optional[Union[Mapping[str, str], Sequence[str]]] = None,
+    colors: Optional[Union[Mapping[str, Any], Sequence[Any], str]] = None,
+    fit_labels: Optional[Union[Mapping[str, str], Sequence[str]]] = None,
+    linewidth: float = 1.8,
+    fit_linewidth: float = 1.8,
+    fit_linestyle: str = "--",
+    legend_kwargs: Optional[Mapping[str, Any]] = None,
     xlabel: Optional[str] = None,
     ylabel: Optional[str] = None,
     title: Optional[str] = None,
@@ -1788,6 +1833,16 @@ def plot_reconfiguration_correlations(
     show_fit_parameters=True includes component parameters in the legend when
     exactly one fitted chain/site contributes to a plotted curve.
     xlabel/ylabel optionally override the default axis labels.
+
+    Supply one result, a mapping {name: correlation_result}, or a sequence
+    [result1, result2, ...]. For multiple results, pass fits with the same
+    mapping keys or in matching sequence order. A one-result fits object is
+    also accepted for a one-result correlation input.
+
+    colors and labels can be keyed mappings or ordered sequences. The fit line
+    matches the corresponding correlation color by default. fit_labels can
+    override auto-generated legend entries for fitted curves. legend=False
+    suppresses the legend, and legend_kwargs is forwarded to ax.legend().
     """
     if not isinstance(include_flagged_fits, (bool, np.bool_)):
         raise TypeError("include_flagged_fits must be a boolean")
@@ -1795,6 +1850,10 @@ def plot_reconfiguration_correlations(
         raise TypeError("show_fit_parameters must be a boolean")
     if uncertainty not in {None, "sem", "std"}:
         raise ValueError("uncertainty must be sem, std, or None")
+    if not (np.isfinite(linewidth) and linewidth >= 0):
+        raise ValueError("linewidth must be finite and nonnegative")
+    if not (np.isfinite(fit_linewidth) and fit_linewidth >= 0):
+        raise ValueError("fit_linewidth must be finite and nonnegative")
     factor, unit = _plot_scale(time_unit)
     if ax is None:
         fig, ax = plt.subplots(figsize=figsize)
@@ -1807,7 +1866,7 @@ def plot_reconfiguration_correlations(
     if fits is not None and any(key not in fit_map for key, _ in items):
         raise KeyError("fits must have the same dataset keys as correlations")
     plotted = False
-    for key, raw in items:
+    for dataset_index, (key, raw) in enumerate(items):
         site = None
         if resnum is not None:
             if raw.residue_numbers is None:
@@ -1880,8 +1939,12 @@ def plot_reconfiguration_correlations(
             good &= mean > 0
         if not np.any(good):
             continue
-        label = labels.get(key, key) if labels is not None else key
-        line = ax.plot(x[good], mean[good], label=label, linewidth=1.8)[0]
+        label = _plot_style_value(labels, key, dataset_index, key, name="labels")
+        selected_color = _plot_style_value(colors, key, dataset_index, None, name="colors")
+        line_kwargs: dict[str, Any] = {"label": label, "linewidth": linewidth}
+        if selected_color is not None:
+            line_kwargs["color"] = selected_color
+        line = ax.plot(x[good], mean[good], **line_kwargs)[0]
         plotted = True
         color = line.get_color()
         if uncertainty is not None:
@@ -1934,8 +1997,16 @@ def plot_reconfiguration_correlations(
                         fit_label += f" (tau={item.tau_ns:.3g} ns)"
                     if item.amplitude != 1.0:
                         fit_label += f" A={item.amplitude:.2g}"
+                fit_label = _plot_style_value(
+                    fit_labels, key, dataset_index, fit_label, name="fit_labels"
+                )
                 ax.plot(
-                    x[keep], prediction_mean[keep], linestyle="--", color=color, label=fit_label
+                    x[keep],
+                    prediction_mean[keep],
+                    linestyle=fit_linestyle,
+                    linewidth=fit_linewidth,
+                    color=color,
+                    label=fit_label,
                 )
     if not plotted:
         raise ValueError(
@@ -1954,7 +2025,9 @@ def plot_reconfiguration_correlations(
     if ylim is not None:
         ax.set_ylim(*ylim)
     if legend:
-        ax.legend()
+        ax.legend(**({} if legend_kwargs is None else dict(legend_kwargs)))
+    elif ax.get_legend() is not None:
+        ax.get_legend().remove()
     _save_plot(fig, save_path, save_dpi)
     return fig, ax
 
@@ -1969,7 +2042,9 @@ def plot_reconfiguration_times(
     yscale: str = "log",
     xlim: Optional[tuple[float, float]] = None,
     ylim: Optional[tuple[float, float]] = None,
-    labels: Optional[Mapping[str, str]] = None,
+    labels: Optional[Union[Mapping[str, str], Sequence[str]]] = None,
+    colors: Optional[Union[Mapping[str, Any], Sequence[Any], str]] = None,
+    legend_kwargs: Optional[Mapping[str, Any]] = None,
     xlabel: Optional[str] = None,
     ylabel: Optional[str] = None,
     title: Optional[str] = None,
@@ -1986,6 +2061,8 @@ def plot_reconfiguration_times(
     inspect residue_n_chains when comparing profiles. For one chain the point
     is plotted with no error bar, because chain variation is not estimable.
     xlabel/ylabel optionally override the default axis labels.
+    Multiple result mappings or ordered sequences are accepted; colors/labels
+    can be keyed mappings or sequences in the corresponding dataset order.
     """
     if uncertainty not in {None, "sem", "std"}:
         raise ValueError("uncertainty must be sem, std, or None")
@@ -1996,7 +2073,7 @@ def plot_reconfiguration_times(
     else:
         fig = ax.figure
     plotted = False
-    for key, fit in _plot_items(fits, ReconfigurationTimeResult):
+    for dataset_index, (key, fit) in enumerate(_plot_items(fits, ReconfigurationTimeResult)):
         if fit.residue_numbers is None:
             raise ValueError("residue profiles require torsion fits, not scalar/Rg fits")
         # Sort residue numbers for line plots; explicit analysis ordering may differ.
@@ -2008,10 +2085,17 @@ def plot_reconfiguration_times(
         if not np.any(good):
             continue
         plotted = True
-        label = labels.get(key, key) if labels is not None else key
-        line = ax.plot(
-            x, np.where(good, y, np.nan), marker="o", markersize=3, linewidth=1.0, label=label
-        )[0]
+        label = _plot_style_value(labels, key, dataset_index, key, name="labels")
+        selected_color = _plot_style_value(colors, key, dataset_index, None, name="colors")
+        line_kwargs: dict[str, Any] = {
+            "marker": "o",
+            "markersize": 3,
+            "linewidth": 1.0,
+            "label": label,
+        }
+        if selected_color is not None:
+            line_kwargs["color"] = selected_color
+        line = ax.plot(x, np.where(good, y, np.nan), **line_kwargs)[0]
         color = line.get_color()
         if uncertainty is not None:
             error = (fit.residue_sem_tau_ns if uncertainty == "sem" else fit.residue_std_tau_ns)[
@@ -2046,6 +2130,8 @@ def plot_reconfiguration_times(
     if ylim is not None:
         ax.set_ylim(*ylim)
     if legend:
-        ax.legend()
+        ax.legend(**({} if legend_kwargs is None else dict(legend_kwargs)))
+    elif ax.get_legend() is not None:
+        ax.get_legend().remove()
     _save_plot(fig, save_path, save_dpi)
     return fig, ax
