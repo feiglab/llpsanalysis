@@ -163,7 +163,7 @@ class ReconfigurationCorrelationResult:
 
 @dataclass(frozen=True)
 class ReconfigurationDecayFit:
-    """One fit; flagged numerical estimates are retained but not accepted by default.
+    """One fit; numerical estimates and quality flags are retained separately.
 
     tau_ns is the amplitude-normalized fitted integral. It is tau for a single
     exponential, fast_fraction*tau_fast_ns+(1-fast_fraction)*tau_slow_ns for a
@@ -231,7 +231,7 @@ class ReconfigurationDecayFit:
 class ReconfigurationTimeResult:
     """Per-chain/residue fits plus descriptive chain-level uncertainty.
 
-    tau_per_chain_residue_ns contains only accepted estimates. Consult fits for
+    tau_per_chain_residue_ns contains estimates admitted by the selected policy. Consult fits for
     every numerical estimate and its flags. mean_tau_ns averages the chain
     means, NOT a fit to the ensemble-averaged ACF. SEM is NaN for one chain.
     With residue_averaging='common', the overall torsion summary uses only
@@ -271,6 +271,73 @@ class ReconfigurationTimeResult:
     @property
     def acceptance_fraction(self) -> float:
         return self.n_accepted / self.n_fitted if self.n_fitted else float("nan")
+
+    def report(self, *, max_rows: Optional[int] = None) -> str:
+        """Format all fitted component parameters and quality diagnostics.
+
+        No thresholding or rejection is performed here. The reported tau is
+        the area of the fitted normalized correlation, not necessarily a
+        well-constrained experimental relaxation time. ``max_rows`` optionally
+        abbreviates large torsion datasets; None includes every site.
+        """
+        if max_rows is not None:
+            max_rows = _integer(max_rows, "max_rows", 1)
+        lines = [
+            f"Dataset: {self.dataset_label} | observables: {', '.join(self.observables)}",
+            f"Fits admitted to summary: {self.n_accepted}/{self.n_fitted} | "
+            f"mean tau = {self.mean_tau_ns:.6g} ns | "
+            f"across-chain SEM = {self.sem_tau_ns:.6g} ns",
+        ]
+        shown = 0
+        total = sum(len(items) for items in self.fits.values())
+        for chain in self.chain_labels:
+            for ri, fit in enumerate(self.fits[chain]):
+                if max_rows is not None and shown >= max_rows:
+                    lines.append(
+                        f"... {total - shown} more site fits (increase max_rows to display)"
+                    )
+                    return "\n".join(lines)
+                residue = (
+                    "Rg"
+                    if self.residue_numbers is None
+                    else f"residue {int(self.residue_numbers[ri])}"
+                )
+                lines.append(
+                    f"{chain} {residue}: model={fit.model} status={fit.status} "
+                    f"accepted={fit.accepted} success={fit.optimizer_success}"
+                )
+                if fit.optimizer_success:
+                    lines.append(
+                        f"  effective tau={fit.tau_ns:.6g} ns; " f"amplitude A={fit.amplitude:.5g}"
+                    )
+                    if fit.model == "double":
+                        lines.append(
+                            f"  tau_fast={fit.tau_fast_ns:.6g} ns; "
+                            f"tau_slow={fit.tau_slow_ns:.6g} ns; "
+                            f"fast fraction f={fit.fast_fraction:.5g}; "
+                            f"slow fraction={1.0 - fit.fast_fraction:.5g}"
+                        )
+                    elif fit.model == "stretched":
+                        lines.append(
+                            f"  tau_scale={fit.tau_scale_ns:.6g} ns; "
+                            f"beta={fit.stretch_beta:.5g}"
+                        )
+                    lines.append(
+                        f"  fit window={fit.fit_tmin_ns:.6g}–{fit.fit_tmax_ns:.6g} ns; "
+                        f"R²={fit.r_squared:.4g}; RMSE={fit.rmse:.5g}; "
+                        f"weighted RMSE={fit.weighted_rmse:.5g}; "
+                        f"robust score={fit.selection_score:.5g}"
+                    )
+                    lines.append(
+                        f"  extrapolated area={fit.tail_fraction:.1%}; "
+                        f"window sensitivity={fit.window_sensitivity:.1%}; "
+                        f"sampled fit points={fit.n_points}"
+                    )
+                lines.append(f"  cautions: {', '.join(fit.flags) if fit.flags else 'none'}")
+                if fit.rejection_flags:
+                    lines.append(f"  rejection reasons: {', '.join(fit.rejection_flags)}")
+                shown += 1
+        return "\n".join(lines)
 
 
 def _chain_indices(
@@ -1179,16 +1246,24 @@ def _fit_one_automatic(
     if chosen.selection_score > max_fit_rmse:
         flags.append("large_fit_residual")
     flags = tuple(dict.fromkeys(flags))
-    # Legacy R-squared and sampling/coverage gates are cautions under standard
-    # policy. Measurable tail extrapolation is checked directly instead of
-    # rejecting every multiscale fit whose slow component exceeds span/2.
+    # A successful fit is always returned. Policy controls only whether a
+    # finite numerical estimate contributes to the reported summary, never
+    # whether its diagnostics are available.
     advisory = {
         "insufficient_decay_window",
         "too_few_relaxation_times",
         "poor_single_decay_fit",
         "poor_decay_fit",
     }
-    rejected = flags if quality_policy == "strict" else tuple(f for f in flags if f not in advisory)
+    if quality_policy == "permissive":
+        # Noise and an underdetermined slow tail are diagnostics, not a reason
+        # to erase a usable numerical fit. A result may remain scientifically
+        # unreliable; see flags, tail_fraction, and window_sensitivity.
+        rejected = ()
+    elif quality_policy == "standard":
+        rejected = tuple(flag for flag in flags if flag not in advisory)
+    else:
+        rejected = flags
     return replace(
         chosen,
         flags=flags,
@@ -1227,7 +1302,8 @@ def fit_reconfiguration_times(
     model_improvement: float = 0.20,
     min_model_improvement: float = 0.005,
     max_fit_rmse: float = 0.08,
-    quality_policy: str = "standard",
+    quality_policy: str = "permissive",
+    report: bool = False,
 ) -> Any:
     """Fit per-chain/site decays and summarize their amplitude-normalized areas.
 
@@ -1266,15 +1342,18 @@ def fit_reconfiguration_times(
     tail_fraction is the fraction of fitted area extrapolated beyond the window.
     Both refer to the chosen model; inspect alternative models as well.
 
-    quality_policy='standard': reject numerical/model failures, large residuals,
-    unresolved sampling intervals/components, substantial negative lobes, >20%
-    extrapolated area, or >35% window sensitivity. The older R-squared,
-    span>=2*slow_tau and observation>=10*slow_tau checks are ADVISORY flags,
-    not automatic vetoes. max_fit_rmse applies to the robust selection score;
-    weighted_rmse and the ordinary R-squared remain available as diagnostics.
-    'strict' rejects any flagged fit. include_flagged=True overrides rejection
-    only for successful finite fits; flags and rejection_flags remain visible.
-    Accepted means numerically usable under these heuristics, not converged.
+    quality_policy='permissive' (default): admit all numerically successful
+    finite fits to the summary, retaining every diagnostic flag. This avoids
+    silently discarding multiscale fits merely because their tail is noisy,
+    extrapolated, or sensitive to the chosen window. It DOES NOT imply physical
+    convergence or identifiability of components. 'standard' retains the prior
+    acceptance gates (large residual, poor identifiability, large extrapolated
+    area, or high window sensitivity), treating R-squared and trajectory-span
+    checks as cautions. 'strict' rejects any flagged fit. include_flagged=True
+    overrides those rejections only for successful numerical fits.
+    report=True prints per-chain/site fit parameters and diagnostics; the same
+    formatted report is available afterward via result.report(). With many
+    residues, use result.report(max_rows=20) to limit output.
 
     Numeric fit limits are physical lag times in ns, inclusive, AFTER kinetic
     scaling. ACF construction and original chain/residue selection are unchanged.
@@ -1314,6 +1393,7 @@ def fit_reconfiguration_times(
                 min_model_improvement=min_model_improvement,
                 max_fit_rmse=max_fit_rmse,
                 quality_policy=quality_policy,
+                report=report,
             )
             for key, value in correlations.items()
         }
@@ -1339,6 +1419,7 @@ def fit_reconfiguration_times(
         ("fit_amplitude", fit_amplitude),
         ("include_flagged", include_flagged),
         ("warn", warn),
+        ("report", report),
         ("auto_window", auto_window),
         ("check_stability", check_stability),
     ):
@@ -1357,8 +1438,8 @@ def fit_reconfiguration_times(
         raise ValueError("loss must be 'linear' or 'soft_l1'")
     if lag_weighting not in {"uniform", "balanced"}:
         raise ValueError("lag_weighting must be 'uniform' or 'balanced'")
-    if quality_policy not in {"standard", "strict"}:
-        raise ValueError("quality_policy must be 'standard' or 'strict'")
+    if quality_policy not in {"permissive", "standard", "strict"}:
+        raise ValueError("quality_policy must be 'permissive', 'standard', or 'strict'")
     for name, value in (("f_scale", f_scale), ("max_fit_rmse", max_fit_rmse)):
         if not np.isfinite(value) or value <= 0:
             raise ValueError(f"{name} must be finite and positive")
@@ -1473,7 +1554,7 @@ def fit_reconfiguration_times(
             RuntimeWarning,
             stacklevel=2,
         )
-    if warn:
+    if warn and quality_policy != "permissive":
         cautions = sorted(
             {
                 reason
@@ -1497,7 +1578,7 @@ def fit_reconfiguration_times(
             RuntimeWarning,
             stacklevel=2,
         )
-    return ReconfigurationTimeResult(
+    result = ReconfigurationTimeResult(
         fits=fits,
         chain_labels=correlations.chain_labels,
         residue_numbers=correlations.residue_numbers,
@@ -1527,6 +1608,9 @@ def fit_reconfiguration_times(
         source_dt_ns=correlations.dt_ns,
         dataset_label=label,
     )
+    if report:
+        print(result.report())
+    return result
 
 
 def _plot_scale(time_unit: str) -> tuple[float, str]:
@@ -1563,6 +1647,7 @@ def plot_reconfiguration_correlations(
     *,
     fits: Any = None,
     include_flagged_fits: bool = False,
+    show_fit_parameters: bool = False,
     resnum: Optional[int] = None,
     show_chains: bool = False,
     uncertainty: Optional[str] = "sem",
@@ -1591,9 +1676,13 @@ def plot_reconfiguration_correlations(
     If no selected fit is accepted, show the raw curve rather than a blank plot.
     include_flagged_fits=True overlays all numerically successful fits for
     diagnosis without changing the accepted time-scale summary.
+    show_fit_parameters=True includes component parameters in the legend when
+    exactly one fitted chain/site contributes to a plotted curve.
     """
     if not isinstance(include_flagged_fits, (bool, np.bool_)):
         raise TypeError("include_flagged_fits must be a boolean")
+    if not isinstance(show_fit_parameters, (bool, np.bool_)):
+        raise TypeError("show_fit_parameters must be a boolean")
     if uncertainty not in {None, "sem", "std"}:
         raise ValueError("uncertainty must be sem, std, or None")
     factor, unit = _plot_scale(time_unit)
@@ -1715,12 +1804,28 @@ def plot_reconfiguration_correlations(
                 ]
                 models = "/".join(sorted({item.model for item in used}))
                 suffix = " (includes flagged)" if any(not item.accepted for item in used) else ""
+                fit_label = f"{label}: {models} fit{suffix}"
+                if show_fit_parameters and len(used) == 1:
+                    item = used[0]
+                    if item.model == "double":
+                        fit_label += (
+                            f" (tau_fast={item.tau_fast_ns:.3g}, "
+                            f"tau_slow={item.tau_slow_ns:.3g} ns; "
+                            f"f={item.fast_fraction:.2g}; "
+                            f"tau_eff={item.tau_ns:.3g} ns)"
+                        )
+                    elif item.model == "stretched":
+                        fit_label += (
+                            f" (tau_scale={item.tau_scale_ns:.3g} ns; "
+                            f"beta={item.stretch_beta:.2g}; "
+                            f"tau_eff={item.tau_ns:.3g} ns)"
+                        )
+                    else:
+                        fit_label += f" (tau={item.tau_ns:.3g} ns)"
+                    if item.amplitude != 1.0:
+                        fit_label += f" A={item.amplitude:.2g}"
                 ax.plot(
-                    x[keep],
-                    prediction_mean[keep],
-                    linestyle="--",
-                    color=color,
-                    label=f"{label}: {models} fit{suffix}",
+                    x[keep], prediction_mean[keep], linestyle="--", color=color, label=fit_label
                 )
     if not plotted:
         raise ValueError(
