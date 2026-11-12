@@ -4443,16 +4443,66 @@ def _save_figure_if_requested(
     figure.savefig(destination, **kwargs)
 
 
+def _torsion_residue_series(
+    result: Any,
+    angle: str,
+    resnum: int,
+) -> tuple[np.ndarray, tuple[str, ...], str]:
+    """Extract one residue's torsion series from each chain containing it.
+
+    Chain residue-number arrays are consulted independently, so different
+    sequences and chain lengths are supported. A residue is addressed by its
+    PDB residue number, not by zero-based row index.
+    """
+    if angle not in {"phi", "psi", "omega", "chi1", "chi2"}:
+        raise ValueError("torsion data_field must be phi, psi, omega, chi1, or chi2")
+    if isinstance(resnum, (bool, np.bool_)) or not isinstance(resnum, (int, np.integer)):
+        raise TypeError("resnum must be an integer PDB residue number")
+
+    rows: list[np.ndarray] = []
+    labels: list[str] = []
+    for label, chain in result.chains.items():
+        numbers = np.asarray(chain.residue_numbers)
+        matches = np.flatnonzero(numbers == int(resnum))
+        if matches.size == 0:
+            continue
+        if matches.size > 1:
+            raise ValueError(
+                f"chain {label!r} has repeated residue number {resnum}; "
+                "cannot choose one torsion unambiguously"
+            )
+        angles = np.asarray(getattr(chain, angle), dtype=np.float64)
+        if angles.ndim != 2 or angles.shape != (numbers.size, int(result.n_frames)):
+            raise ValueError(f"chain {label!r}: invalid {angle} array shape {angles.shape}")
+        rows.append(angles[int(matches[0]), :])
+        labels.append(str(label))
+
+    if not rows:
+        raise ValueError(f"no atomistic chains contain residue {resnum}")
+    data = np.stack(rows, axis=0)
+    if not np.any(np.isfinite(data)):
+        raise ValueError(f"{angle} is undefined for residue {resnum} in every selected chain")
+
+    unit = str(result.unit).strip().lower()
+    if unit not in {"radians", "degrees"}:
+        raise ValueError(f"unsupported torsion angle unit {result.unit!r}")
+    return data, tuple(labels), unit
+
+
 def plot_timeseries(
     result: Any,
     data_field: str,
     delta_t: Union[float, int, object],
     *,
+    resnum: Optional[int] = None,
     x_label: Optional[str] = None,
     y_label: Optional[str] = None,
     title: Optional[str] = None,
     chain_indices: Optional[Sequence[int]] = None,
     chain_labels: Optional[Sequence[str]] = None,
+    include_chains: Optional[Sequence[str]] = None,
+    exclude_chains: Optional[Sequence[str]] = None,
+    strict_chain_selection: bool = True,
     ax: Optional[plt.Axes] = None,
     figsize: tuple[float, float] = (10.0, 4.0),
     time_unit: str = "ns",
@@ -4490,13 +4540,51 @@ def plot_timeseries(
     X-axis values use the selected ``time_unit``. If omitted, Matplotlib
     determines tick locations automatically.
 
+    When ``result`` is a PeptideTorsionResult, supply ``resnum`` and an angle
+    name (``phi``, ``psi``, ``omega``, ``chi1``, or ``chi2``). This plots the
+    corresponding PDB residue number across all chains containing it. For
+    torsions, ``show_mean=True`` plots the *circular* mean across chains rather
+    than an incorrect arithmetic mean near the -pi/pi (or -180/180) boundary.
+
+    ``include_chains`` and ``exclude_chains`` accept exact physical chain/segment
+    IDs such as ["P001", "P003"] and are mutually exclusive. If ``chain_indices``
+    is also provided, both filters apply (intersection); ``chain_indices`` refers
+    to the plotted row order, after any torsion residue extraction. By default,
+    unknown chain names raise an error. Set ``strict_chain_selection=False``
+    to ignore unavailable names, e.g. when different chains lack a residue.
+    ``chain_labels`` remains a display-label override, not a selection filter.
+
     When ``save_path`` is provided, the figure is written with
     :meth:`matplotlib.figure.Figure.savefig`. Additional keyword arguments may
     be passed via ``save_kwargs``.
     """
-    data = np.asarray(_result_field(result, data_field), dtype=np.float64)
-    if data.ndim != 2:
-        raise ValueError(f"{data_field} must have shape (n_chains, n_frames)")
+    if include_chains is not None and exclude_chains is not None:
+        raise ValueError("include_chains and exclude_chains are mutually exclusive")
+    if not isinstance(strict_chain_selection, (bool, np.bool_)):
+        raise TypeError("strict_chain_selection must be a boolean")
+
+    is_torsion = hasattr(result, "chains") and hasattr(result, "unit")
+    torsion_unit: Optional[str] = None
+    physical_chain_labels: Optional[tuple[str, ...]] = None
+    if is_torsion:
+        if resnum is None:
+            raise ValueError("resnum is required to plot a torsion time series")
+        data, selected_chain_labels, torsion_unit = _torsion_residue_series(
+            result, data_field, resnum
+        )
+        physical_chain_labels = selected_chain_labels
+        if chain_labels is None:
+            chain_labels = selected_chain_labels
+    else:
+        if resnum is not None:
+            raise ValueError("resnum is only valid for peptide torsion results")
+        data = np.asarray(_result_field(result, data_field), dtype=np.float64)
+        if data.ndim != 2:
+            raise ValueError(f"{data_field} must have shape (n_chains, n_frames)")
+        if hasattr(result, "chain_labels"):
+            candidate = tuple(str(label) for label in result.chain_labels)
+            if len(candidate) == data.shape[0]:
+                physical_chain_labels = candidate
 
     n_chains, n_frames = data.shape
     if n_chains == 0 or n_frames == 0:
@@ -4516,6 +4604,42 @@ def plot_timeseries(
             raise ValueError("chain_indices is empty")
         if np.any(selected < 0) or np.any(selected >= n_chains):
             raise ValueError("chain_indices contains an out-of-range index")
+
+    if include_chains is not None or exclude_chains is not None:
+        if physical_chain_labels is None:
+            raise ValueError(
+                "include_chains/exclude_chains requires a result with valid physical "
+                "chain_labels (or a peptide-torsion result)"
+            )
+        if len(set(physical_chain_labels)) != n_chains:
+            raise ValueError("result chain_labels must be unique for named chain selection")
+
+        spec = include_chains if include_chains is not None else exclude_chains
+        if isinstance(spec, (str, bytes)) or not isinstance(spec, Sequence):
+            raise TypeError("include_chains/exclude_chains must be a sequence of segment IDs")
+        wanted = tuple(str(label) for label in spec)
+        if len(set(wanted)) != len(wanted):
+            raise ValueError("chain selection contains duplicate segment IDs")
+        missing = sorted(set(wanted) - set(physical_chain_labels))
+        if missing and strict_chain_selection:
+            raise ValueError(
+                f"unknown chain IDs {missing}; available for this property/residue: "
+                f"{list(physical_chain_labels)}"
+            )
+
+        wanted_set = set(wanted)
+        if include_chains is not None:
+            selected = np.asarray(
+                [i for i in selected if physical_chain_labels[int(i)] in wanted_set],
+                dtype=np.int64,
+            )
+        else:
+            selected = np.asarray(
+                [i for i in selected if physical_chain_labels[int(i)] not in wanted_set],
+                dtype=np.int64,
+            )
+        if selected.size == 0:
+            raise ValueError("chain selection leaves no chains to plot")
 
     if chain_labels is None and hasattr(result, "chain_labels"):
         candidate_labels = list(getattr(result, "chain_labels"))
@@ -4575,21 +4699,40 @@ def plot_timeseries(
     if show_mean:
         finite = np.isfinite(selected_data)
         counts = np.sum(finite, axis=0)
-        sums = np.sum(np.where(finite, selected_data, 0.0), axis=0)
-        mean = np.full(n_frames, np.nan, dtype=float)
         valid = counts > 0
-        mean[valid] = sums[valid] / counts[valid]
+        mean = np.full(n_frames, np.nan, dtype=float)
+        if is_torsion:
+            angles_rad = np.deg2rad(selected_data) if torsion_unit == "degrees" else selected_data
+            # Invalid angles contribute neither sin nor cos.
+            safe_angles = np.where(finite, angles_rad, 0.0)
+            sin_sum = np.sum(np.where(finite, np.sin(safe_angles), 0.0), axis=0)
+            cos_sum = np.sum(np.where(finite, np.cos(safe_angles), 0.0), axis=0)
+            # The circular mean is undefined when the resultant vector vanishes.
+            valid &= np.hypot(sin_sum, cos_sum) > 1.0e-12 * counts
+            mean[valid] = np.arctan2(sin_sum[valid], cos_sum[valid])
+            if torsion_unit == "degrees":
+                mean = np.rad2deg(mean)
+        else:
+            sums = np.sum(np.where(finite, selected_data, 0.0), axis=0)
+            mean[valid] = sums[valid] / counts[valid]
         ax.plot(
             time,
             mean,
             linewidth=float(mean_linewidth),
             color=mean_color,
-            label="mean",
+            label="circular mean" if is_torsion else "mean",
         )
 
     ax.set_xlabel(x_label if x_label is not None else f"time ({time_label})")
-    ax.set_ylabel(y_label or data_field)
-    ax.set_title(title or f"{data_field} vs time")
+    if is_torsion:
+        unit_label = "°" if torsion_unit == "degrees" else "rad"
+        default_ylabel = f"{data_field} ({unit_label})"
+        default_title = f"{data_field} residue {resnum} vs time"
+    else:
+        default_ylabel = data_field
+        default_title = f"{data_field} vs time"
+    ax.set_ylabel(y_label or default_ylabel)
+    ax.set_title(title or default_title)
 
     if xlim is not None:
         ax.set_xlim(*xlim)
