@@ -35,6 +35,8 @@ from mdsim.analysis import (
     MinimumContactDistanceResult,
     MSDFitResult,
     MSDResult,
+    PeptideTorsionChainResult,
+    PeptideTorsionResult,
     RadialTranslationalDiffusionFitResult,
     RadialTranslationalMSDResult,
     ResidueDensityProfileResult,
@@ -51,6 +53,7 @@ from mdsim.analysis import (
     mass_density_profile_from_dcd,
     minimum_contact_distances_from_dcd,
     msd_from_dcd,
+    peptide_torsions_from_dcd,
     radial_translational_msd_from_trajectories,
     reference_center_distances_from_dcd,
     residue_density_profile_from_dcd,
@@ -441,6 +444,9 @@ __all__ = [
     "MDSim",
     "MassDensityProfileResult",
     "MinimumContactDistanceResult",
+    "PeptideTorsionChainResult",
+    "PeptideTorsionResult",
+    "peptide_torsions_from_dcd",
     "MSDFitResult",
     "MSDResult",
     "ChainCOMTrajectoryResult",
@@ -5583,6 +5589,53 @@ def _is_density_profile_calculation(calc: str) -> bool:
     }
 
 
+def _selected_peptide_torsions(
+    result: PeptideTorsionResult,
+    pdb_file: PathLike,
+    selection: Any,
+) -> PeptideTorsionResult:
+    """Keep all residues of each atomistic chain touched by a group selection.
+
+    mdsim.peptide_torsions_from_dcd currently analyzes every atomistic chain;
+    notebook ``segs`` values identify which physical chains belong to a group.
+    A residue- or atom-restricted selector is used to *identify chains*, not to
+    remove other residues from those chains.
+    """
+    template = PDBReader().read(pdb_file)
+    model = template.model
+
+    if isinstance(selection, str) or (
+        isinstance(selection, Sequence)
+        and not isinstance(selection, (str, bytes))
+        and all(isinstance(item, str) for item in selection)
+    ):
+        selected_atoms = set(StructureSelector(selection).atom_indices(template))
+    elif isinstance(selection, Sequence) and not isinstance(selection, (str, bytes)):
+        # As elsewhere in this module, explicit groups of template atom indices
+        # are accepted in addition to StructureSelector strings.
+        selected_atoms = {int(index) for group in selection for index in group}
+    else:
+        raise TypeError("torsion chain selection must be a selector or sequence of selectors")
+
+    if not selected_atoms:
+        raise ValueError(f"torsion selection {selection!r} selected no atoms")
+
+    global_index = {id(atom): i for i, atom in enumerate(model.atoms)}
+    chains = {}
+    for label, chain_result in result.chains.items():
+        physical_chain = model.chain[label]
+        if any(
+            global_index[id(atom)] in selected_atoms
+            for residue in physical_chain.residues
+            for atom in residue.atoms
+        ):
+            chains[label] = chain_result
+
+    # Coarse-grained-only groups are legitimate in mixed-resolution systems.
+    # Retain their dataset key with n_chains=0 instead of failing the entire call.
+    return replace(result, chains=chains)
+
+
 def calculate(
     calc: str,
     pdb: PathLike,
@@ -5635,13 +5688,17 @@ def calculate(
     residue_site: Optional[str] = None,
     remove_reference_motion: bool = False,
     unwrap_within_frame: bool = False,
+    degrees: bool = False,
+    check_peptide_bonds: bool = True,
+    peptide_bond_cutoff_nm: float = 0.22,
+    torsion_dtype: Any = "float32",
 ) -> Any:
     """Run one of the common notebook analyses.
 
     Supported values for ``calc`` are ``rgyr``, ``contacts``, ``centerdist``,
     ``densityprofile``, ``intrachain``, ``interchain``, ``mincontact``,
-    ``distmsd``, ``distmsdmap``, and ``contactmap``. A few descriptive
-    aliases are accepted.
+    ``distmsd``, ``distmsdmap``, ``contactmap``, and ``peptide-torsions``.
+    A few descriptive aliases are accepted.
 
     For ``rgyr``, ``contacts``, and ``centerdist``, chain/residue selections
     are restricted to ``selection_atom_name`` before being passed to mdsim.
@@ -5714,6 +5771,14 @@ def calculate(
     in a temporary disk-backed memmap so RAM does not scale with the full selected
     trajectory. ``backend='process'`` parallelizes residue-pair blocks.
 
+    For ``peptide-torsions``, mdsim calculates phi, psi, omega, chi1, and chi2
+    for all atomistic chains. The supplied ``selection`` then restricts the
+    physical chains kept in the result, retaining every residue of each chain.
+    The result has a ``chains`` mapping (chain label -> per-residue arrays).
+    ``degrees``, ``check_peptide_bonds``, ``peptide_bond_cutoff_nm``, and
+    ``torsion_dtype`` are forwarded to mdsim. ``pbc`` controls minimum-imaging
+    of individual bond vectors.
+
     For ``contactmap``, the function caches compact sparse per-frame CA contact events
     up to ``cutoff_nm``. ``query_site_chunk`` limits the number of query CA sites
     processed at once and therefore controls peak neighbor-search memory.
@@ -5762,6 +5827,10 @@ def calculate(
         "distance_msd_1d": "distmsd1d",
         "unconditional_msd": "distmsd1d",
         "dist_msd_1d": "distmsd1d",
+        "peptide_torsions": "peptide_torsions",
+        "peptidetorsions": "peptide_torsions",
+        "torsions": "peptide_torsions",
+        "torsion": "peptide_torsions",
     }
     calc_key = aliases.get(calc_key, calc_key)
 
@@ -5798,6 +5867,41 @@ def calculate(
             refsel,
             selection_atom_name,
         )
+
+    if calc_key == "peptide_torsions":
+        # Time limits are interpreted on the strided trajectory frame grid.
+        uses_time = time_start is not None or time_stop is not None
+        if uses_time and (int(frame_start) != 0 or frame_stop is not None):
+            raise ValueError("use either time_start/time_stop or frame_start/frame_stop")
+        first, last = int(frame_start), frame_stop
+        if uses_time:
+            if delta_t is None:
+                raise ValueError("delta_t is required for time-based torsion selection")
+            dt_ns = _delta_t_to_ns(delta_t) * int(stride)
+            t0 = 0.0 if time_start is None else _time_value_to_ns(time_start, name="time_start")
+            t1 = None if time_stop is None else _time_value_to_ns(time_stop, name="time_stop")
+            if t0 < 0.0 or (t1 is not None and t1 <= t0):
+                raise ValueError("time limits must satisfy 0 <= time_start < time_stop")
+            first = max(0, int(math.ceil(t0 / dt_ns - 1.0e-12)))
+            last = None if t1 is None else max(0, int(math.ceil(t1 / dt_ns - 1.0e-12)))
+            if last is not None and last <= first:
+                raise ValueError("time window selects no torsion frames")
+
+        all_torsions = peptide_torsions_from_dcd(
+            pdb_file=Path(pdb),
+            dcd_files=dcd_files,
+            degrees=bool(degrees),
+            pbc=bool(pbc),
+            box_nm=box_nm,
+            check_peptide_bonds=bool(check_peptide_bonds),
+            peptide_bond_cutoff_nm=float(peptide_bond_cutoff_nm),
+            stride=int(stride),
+            chunk=int(chunk),
+            frame_start=first,
+            frame_stop=last,
+            dtype=torsion_dtype,
+        )
+        return _selected_peptide_torsions(all_torsions, pdb, selection)
 
     if calc_key == "comtraj":
         if delta_t is None:
@@ -6227,7 +6331,7 @@ def calculate(
             **common,
         )
 
-    supported = "rgyr, contacts, centerdist, comtraj, densityprofile, intrachain, interchain, mincontact, distmsd, distmsd1d, distmsdmap, contactmap"
+    supported = "rgyr, contacts, centerdist, comtraj, densityprofile, intrachain, interchain, mincontact, distmsd, distmsd1d, distmsdmap, contactmap, peptide-torsions"
     raise ValueError(f"unknown calculation type {calc!r}; choose one of: {supported}")
 
 
@@ -6298,6 +6402,10 @@ def _get_values_serial(
     residue_site: Optional[str] = None,
     remove_reference_motion: bool = False,
     unwrap_within_frame: bool = False,
+    degrees: bool = False,
+    check_peptide_bonds: bool = True,
+    peptide_bond_cutoff_nm: float = 0.22,
+    torsion_dtype: Any = "float32",
 ) -> dict[str, Any]:
     """Calculate or load cached results for each set/group combination.
 
@@ -6317,6 +6425,13 @@ def _get_values_serial(
     chain selection and ``pairsel`` supplies the ordered two-atom selection. The
     returned mapping uses the same ``<set>_<group>`` keys as the other analyses.
     ``bins`` and ``value_range`` define initial-distance bins; ``delta_t`` is required.
+
+    For ``calc="peptide-torsions"``, each ``segs`` group retains all residues of
+    matching atomistic chains (coarse-grained-only groups have zero chains).
+    The DCD is read once per set across all groups in serial mode.
+    The cache includes units, PBC, peptide-bond
+    validation settings, and dtype in its filename. Use ``tag`` or ``overwrite``
+    when changing the trajectory stride or frame/time window.
 
     For ``calc="distmsdmap"``, ``segs`` supplies the full homologous-chain pool.
     Optional ``refsel`` restricts only the physical/reference chains whose replicate
@@ -6362,6 +6477,7 @@ def _get_values_serial(
     }
     calc_key = str(calc).strip().lower().replace("-", "_")
     is_comtraj = calc_key in {"comtraj", "com_trajectory", "chain_com", "translational_trajectory"}
+    is_peptide_torsions = calc_key in {"peptide_torsions", "peptidetorsions", "torsion", "torsions"}
     is_distmsdmap = calc_key in {
         "distmsdmap",
         "dist_msd_map",
@@ -6386,11 +6502,25 @@ def _get_values_serial(
         set_name = str(set_label)
         pdb_file = root / set_name / pdb_name
         dcd_file = root / set_name / dcd_name
+        # mdsim evaluates all atomistic chains, irrespective of the group.
+        # Reuse one calculation across groups within this simulation set.
+        all_torsions_for_set: Optional[PeptideTorsionResult] = None
 
         for group_label, selection in segs.items():
             group_name = str(group_label)
             key = f"{set_name}_{group_name}"
-            cache_calc_label = f"{calc}{tag}"
+            cache_calc_label = f"{'peptide-torsions' if is_peptide_torsions else calc}{tag}"
+            if is_peptide_torsions:
+                # Unlike most analysis names, these fundamentally change the
+                # output or geometry and must never reuse a cache accidentally.
+                cache_calc_label += ".degrees" if degrees else ".radians"
+                cache_calc_label += ".pbc" if pbc else ".whole"
+                cache_calc_label += (
+                    f".bondcut-{float(peptide_bond_cutoff_nm):g}nm"
+                    if check_peptide_bonds
+                    else ".no-bond-check"
+                )
+                cache_calc_label += f".{np.dtype(torsion_dtype).name}"
             if (
                 is_densityprofile
                 or is_residuedensity
@@ -6443,58 +6573,70 @@ def _get_values_serial(
                         )
                     refsel_for_key = refsel[key]
 
-                value = calculate(
-                    calc=calc,
-                    pdb=pdb_file,
-                    dcd=dcd_file,
-                    selection=selection,
-                    selection2=sel2,
-                    refsel=refsel_for_key,
-                    pairsel=pairsel,
-                    option=option,
-                    include_hydrogens=include_hydrogens,
-                    sidechain_only=sidechain_only,
-                    workers=workers,
-                    query_site_chunk=query_site_chunk,
-                    stride=stride,
-                    chunk=chunk,
-                    frame_start=frame_start,
-                    frame_stop=frame_stop,
-                    time_start=time_start,
-                    time_stop=time_stop,
-                    delta_t=delta_t,
-                    bins=bins,
-                    value_range=value_range,
-                    box_nm=box_nm,
-                    mode=mode,
-                    cutoff_nm=cutoff_nm,
-                    pbc=pbc,
-                    diffusion_mode=diffusion_mode,
-                    distance_image=distance_image,
-                    lags_frames=lags_frames,
-                    max_lag_frames=max_lag_frames,
-                    lag_stride=lag_stride,
-                    origin_stride=origin_stride,
-                    inter_targets_per_ref=inter_targets_per_ref,
-                    random_seed=random_seed,
-                    backend=backend,
-                    n_jobs=n_jobs,
-                    mp_start_method=mp_start_method,
-                    min_intra_sequence_separation=min_intra_sequence_separation,
-                    pair_block_size=pair_block_size,
-                    origin_chunk=origin_chunk,
-                    reference_chunk=reference_chunk,
-                    map_work_dtype=map_work_dtype,
-                    map_work_dir=map_work_dir,
-                    exclude_reference=exclude_reference,
-                    reference_label=reference_label,
-                    distance_axes=distance_axes_name,
-                    reference_image_mode=reference_image_mode_name,
-                    selection_atom_name=selection_atom_name,
-                    residue_site=residue_site,
-                    remove_reference_motion=remove_reference_motion,
-                    unwrap_within_frame=unwrap_within_frame,
-                )
+                if is_peptide_torsions and all_torsions_for_set is not None:
+                    value = _selected_peptide_torsions(all_torsions_for_set, pdb_file, selection)
+                else:
+                    value = calculate(
+                        calc=calc,
+                        pdb=pdb_file,
+                        dcd=dcd_file,
+                        selection="all" if is_peptide_torsions else selection,
+                        selection2=sel2,
+                        refsel=refsel_for_key,
+                        pairsel=pairsel,
+                        option=option,
+                        include_hydrogens=include_hydrogens,
+                        sidechain_only=sidechain_only,
+                        workers=workers,
+                        query_site_chunk=query_site_chunk,
+                        stride=stride,
+                        chunk=chunk,
+                        frame_start=frame_start,
+                        frame_stop=frame_stop,
+                        time_start=time_start,
+                        time_stop=time_stop,
+                        delta_t=delta_t,
+                        bins=bins,
+                        value_range=value_range,
+                        box_nm=box_nm,
+                        mode=mode,
+                        cutoff_nm=cutoff_nm,
+                        pbc=pbc,
+                        diffusion_mode=diffusion_mode,
+                        distance_image=distance_image,
+                        lags_frames=lags_frames,
+                        max_lag_frames=max_lag_frames,
+                        lag_stride=lag_stride,
+                        origin_stride=origin_stride,
+                        inter_targets_per_ref=inter_targets_per_ref,
+                        random_seed=random_seed,
+                        backend=backend,
+                        n_jobs=n_jobs,
+                        mp_start_method=mp_start_method,
+                        min_intra_sequence_separation=min_intra_sequence_separation,
+                        pair_block_size=pair_block_size,
+                        origin_chunk=origin_chunk,
+                        reference_chunk=reference_chunk,
+                        map_work_dtype=map_work_dtype,
+                        map_work_dir=map_work_dir,
+                        exclude_reference=exclude_reference,
+                        reference_label=reference_label,
+                        distance_axes=distance_axes_name,
+                        reference_image_mode=reference_image_mode_name,
+                        selection_atom_name=selection_atom_name,
+                        residue_site=residue_site,
+                        remove_reference_motion=remove_reference_motion,
+                        unwrap_within_frame=unwrap_within_frame,
+                        degrees=degrees,
+                        check_peptide_bonds=check_peptide_bonds,
+                        peptide_bond_cutoff_nm=peptide_bond_cutoff_nm,
+                        torsion_dtype=torsion_dtype,
+                    )
+                    if is_peptide_torsions:
+                        all_torsions_for_set = value
+                        value = _selected_peptide_torsions(
+                            all_torsions_for_set, pdb_file, selection
+                        )
                 save_data(cache_file, value)
                 data[key] = value
             else:
@@ -6596,12 +6738,20 @@ def get_values(
     residue_site: Optional[str] = None,
     remove_reference_motion: bool = False,
     unwrap_within_frame: bool = False,
+    degrees: bool = False,
+    check_peptide_bonds: bool = True,
+    peptide_bond_cutoff_nm: float = 0.22,
+    torsion_dtype: Any = "float32",
 ) -> dict[str, Any]:
     """Calculate/load results, optionally parallelizing independent set/group jobs.
 
-    ``parallel_workers`` controls notebook-level concurrency across the Cartesian
-    product of ``sets`` and ``segs``.  The default of 1 preserves the original
-    serial behavior.  ``parallel_workers=-1`` uses all logical CPUs.
+    ``calc="peptide-torsions"`` returns one mdsim PeptideTorsionResult per
+    set/group with only the selected physical chains. Radians are the default.
+
+    ``parallel_workers`` normally parallelizes independent set/group jobs.
+    For ``peptide-torsions`` it instead parallelizes simulation sets, avoiding
+    redundant DCD passes when ``segs`` contains several groups. The default
+    of 1 is serial; ``parallel_workers=-1`` uses all logical CPUs.
 
     ``parallel_backend='thread'`` is the default because NumPy/SciPy trajectory
     kernels release the GIL and threads avoid copying large result objects between
@@ -6626,8 +6776,12 @@ def get_values(
     """
     n_outer = _parallel_worker_count(parallel_workers)
     backend_name = _parallel_backend_name(parallel_backend)
+    calc_key = str(calc).strip().lower().replace("-", "_")
+    is_peptide_torsions = calc_key in {"peptide_torsions", "peptidetorsions", "torsion", "torsions"}
 
-    if n_outer == 1 or (len(sets) * len(segs)) <= 1:
+    # The mdsim torsion routine processes all atomistic chains per DCD.
+    # With one set, run the groups together so the DCD is read just once.
+    if n_outer == 1 or (len(sets) * len(segs)) <= 1 or (is_peptide_torsions and len(sets) <= 1):
         return _get_values_serial(
             sets,
             segs,
@@ -6684,6 +6838,10 @@ def get_values(
             residue_site=residue_site,
             remove_reference_motion=remove_reference_motion,
             unwrap_within_frame=unwrap_within_frame,
+            degrees=degrees,
+            check_peptide_bonds=check_peptide_bonds,
+            peptide_bond_cutoff_nm=peptide_bond_cutoff_nm,
+            torsion_dtype=torsion_dtype,
         )
 
     common_kwargs = dict(
@@ -6740,7 +6898,37 @@ def get_values(
         residue_site=residue_site,
         remove_reference_motion=remove_reference_motion,
         unwrap_within_frame=unwrap_within_frame,
+        degrees=degrees,
+        check_peptide_bonds=check_peptide_bonds,
+        peptide_bond_cutoff_nm=peptide_bond_cutoff_nm,
+        torsion_dtype=torsion_dtype,
     )
+
+    if is_peptide_torsions:
+        # Parallelize independent sets, rather than groups from the same DCD.
+        # Each worker creates and caches all requested group results in one pass.
+        Executor = ThreadPoolExecutor if backend_name == "thread" else ProcessPoolExecutor
+        merged: dict[str, Any] = {}
+        with Executor(max_workers=min(n_outer, len(sets))) as executor:
+            future_to_set = {
+                executor.submit(_get_values_serial, [str(set_label)], segs, **common_kwargs): str(
+                    set_label
+                )
+                for set_label in sets
+            }
+            for future in as_completed(future_to_set):
+                set_name = future_to_set[future]
+                try:
+                    merged.update(future.result())
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"parallel peptide-torsions calculation failed for set {set_name!r}"
+                    ) from exc
+        return {
+            f"{set_label}_{group_label}": merged[f"{set_label}_{group_label}"]
+            for set_label in map(str, sets)
+            for group_label in map(str, segs)
+        }
 
     tasks: list[tuple[str, str, Any]] = []
     expected_order: list[str] = []
