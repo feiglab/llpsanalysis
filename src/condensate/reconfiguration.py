@@ -12,7 +12,9 @@ Combined torsions average their separately normalized correlations (equal weight
 by default). This is a local feature-memory measure, NOT a joint-state survival
 probability, a first-passage time, or an exhaustive conformational mixing time.
 
-Each chain/residue is fitted separately. Residue times are averaged within each
+By default each chain/residue is fitted separately. With aggregation="aggregate",
+normalized correlations are averaged first and whole-chain bootstrap errors are
+available. Individual-mode residue times are averaged within each
 chain, then chain means are averaged; residues are never counted as independent
 replicates for the overall SEM. Chain SEM assumes independent chains and may be
 optimistic for interacting chains in a single condensate.
@@ -39,6 +41,7 @@ __all__ = [
     "ReconfigurationCorrelationResult",
     "ReconfigurationDecayFit",
     "ReconfigurationTimeResult",
+    "ReconfigurationAggregateTimeResult",
     "calculate_reconfiguration_correlations",
     "fit_reconfiguration_times",
     "plot_reconfiguration_correlations",
@@ -1383,6 +1386,501 @@ def _fit_one_automatic(
     )
 
 
+@dataclass(frozen=True)
+class ReconfigurationAggregateTimeResult:
+    """Fits to equal-chain means of normalized correlations, not mean chain fits.
+
+    ``fit`` describes the overall mean curve. For torsions, correlations are
+    first averaged over selected residues within each chain, then over chains.
+    ``residue_fits`` independently describe each residue's chain-mean curve.
+    ``overall_site_mask`` and ``residue_site_mask`` record fixed contributors;
+    membership never changes with lag or according to a chain's fitted time.
+
+    Bootstrap replicates resample complete chains, using the SAME sampled chain
+    IDs across residues. Model and fitting window are fixed to those selected
+    for the original aggregate. Intervals are therefore conditional on those
+    choices and the input/core selection. They do not measure finite-record bias
+    or account for dependence between chains. All numerical bootstrap estimates,
+    including flagged/boundary estimates, are retained. SE/CI return NaN when
+    any numerical replicate fails, rather than silently conditioning on success.
+    With one contributing chain or no bootstrap, SE/CI are undefined.
+
+    ``mean_*`` and ``sem_*`` aliases retain familiar notebook field names, but
+    here they mean aggregate-fit parameters and chain-bootstrap standard errors.
+    They are NOT means/SEMs of individually fitted chain parameters.
+    """
+
+    fit: ReconfigurationDecayFit
+    residue_fits: tuple[ReconfigurationDecayFit, ...]
+    bootstrap_fits: tuple[ReconfigurationDecayFit, ...]
+    residue_bootstrap_fits: tuple[tuple[ReconfigurationDecayFit, ...], ...]
+    bootstrap_chain_indices: np.ndarray
+    chain_labels: tuple[str, ...]
+    residue_numbers: Optional[np.ndarray]
+    observables: tuple[str, ...]
+    kind: str
+    model: str
+    lag_time_ns: np.ndarray
+    overall_site_mask: np.ndarray
+    residue_site_mask: np.ndarray
+    aggregate_correlation: np.ndarray
+    residue_aggregate_correlation: np.ndarray
+    residue_averaging: str
+    kinetic_scale: float
+    source_frame_start: int
+    source_frame_stop: int
+    source_dt_ns: float
+    n_bootstrap_requested: int
+    confidence_level: float
+    dataset_label: str = "data"
+    aggregation: str = "aggregate"
+
+    @property
+    def n_chains(self) -> int:
+        return int(np.count_nonzero(np.any(self.overall_site_mask, axis=1)))
+
+    @property
+    def n_total_chains(self) -> int:
+        return len(self.chain_labels)
+
+    @property
+    def contributing_chain_labels(self) -> tuple[str, ...]:
+        keep = np.any(self.overall_site_mask, axis=1)
+        return tuple(label for label, used in zip(self.chain_labels, keep) if used)
+
+    @property
+    def residue_n_chains(self) -> np.ndarray:
+        return self.residue_site_mask.sum(axis=0)
+
+    @property
+    def summary_residue_numbers(self) -> Optional[np.ndarray]:
+        if self.residue_numbers is None:
+            return None
+        return self.residue_numbers[np.any(self.overall_site_mask, axis=0)]
+
+    @property
+    def n_bootstrap_successful(self) -> int:
+        return sum(
+            item.optimizer_success and np.isfinite(item.tau_ns) for item in self.bootstrap_fits
+        )
+
+    @property
+    def n_bootstrap_flagged(self) -> int:
+        return sum(bool(item.flags) for item in self.bootstrap_fits)
+
+    def parameter_samples(
+        self, parameter: str = "tau_ns", *, resnum: Optional[int] = None
+    ) -> np.ndarray:
+        """All numerical bootstrap estimates, without quality-flag filtering."""
+        fits, _, _ = self._bootstrap_source(resnum)
+        supported = {
+            "tau_ns",
+            "tau_fast_ns",
+            "tau_slow_ns",
+            "fast_fraction",
+            "amplitude",
+            "tau_scale_ns",
+            "stretch_beta",
+        }
+        if parameter not in supported:
+            raise ValueError(f"parameter must be one of {sorted(supported)}")
+        return np.array(
+            [
+                float(getattr(item, parameter)) if item.optimizer_success else np.nan
+                for item in fits
+            ],
+            dtype=float,
+        )
+
+    def _bootstrap_source(self, resnum: Optional[int]) -> tuple[Any, int, Any]:
+        if resnum is None:
+            return self.bootstrap_fits, self.n_chains, self.fit
+        if self.residue_numbers is None:
+            raise ValueError("resnum applies only to residue-resolved torsion fits")
+        match = np.flatnonzero(self.residue_numbers == _integer(resnum, "resnum"))
+        if match.size != 1:
+            raise ValueError(f"residue {resnum} is not present")
+        index = int(match[0])
+        return (
+            self.residue_bootstrap_fits[index],
+            int(self.residue_n_chains[index]),
+            self.residue_fits[index],
+        )
+
+    def standard_error(self, parameter: str = "tau_ns", *, resnum: Optional[int] = None) -> float:
+        """Sample SD of bootstrap estimates; NOT divided by sqrt(n_bootstrap)."""
+        _, n, point = self._bootstrap_source(resnum)
+        values = self.parameter_samples(parameter, resnum=resnum)
+        if not point.accepted or n < 2 or len(values) < 2 or not np.all(np.isfinite(values)):
+            return float("nan")
+        return float(np.std(values, ddof=1))
+
+    def confidence_interval(
+        self, parameter: str = "tau_ns", *, resnum: Optional[int] = None
+    ) -> tuple[float, float]:
+        """Percentile bootstrap interval, conditional on the fixed model/window."""
+        _, n, point = self._bootstrap_source(resnum)
+        values = self.parameter_samples(parameter, resnum=resnum)
+        if not point.accepted or n < 2 or len(values) < 2 or not np.all(np.isfinite(values)):
+            return float("nan"), float("nan")
+        alpha = (1.0 - self.confidence_level) / 2.0
+        low, high = np.quantile(values, [alpha, 1.0 - alpha])
+        return float(low), float(high)
+
+    @property
+    def mean_tau_ns(self) -> float:
+        return self.fit.tau_ns if self.fit.accepted else float("nan")
+
+    @property
+    def sem_tau_ns(self) -> float:
+        return self.standard_error("tau_ns")
+
+    @property
+    def mean_tau_fast_ns(self) -> float:
+        return (
+            self.fit.tau_fast_ns
+            if self.fit.accepted and self.fit.model == "double"
+            else float("nan")
+        )
+
+    @property
+    def sem_tau_fast_ns(self) -> float:
+        return self.standard_error("tau_fast_ns") if self.fit.model == "double" else float("nan")
+
+    @property
+    def mean_tau_slow_ns(self) -> float:
+        return (
+            self.fit.tau_slow_ns
+            if self.fit.accepted and self.fit.model == "double"
+            else float("nan")
+        )
+
+    @property
+    def sem_tau_slow_ns(self) -> float:
+        return self.standard_error("tau_slow_ns") if self.fit.model == "double" else float("nan")
+
+    @property
+    def mean_fast_fraction(self) -> float:
+        return (
+            self.fit.fast_fraction
+            if self.fit.accepted and self.fit.model == "double"
+            else float("nan")
+        )
+
+    @property
+    def sem_fast_fraction(self) -> float:
+        return self.standard_error("fast_fraction") if self.fit.model == "double" else float("nan")
+
+    @property
+    def residue_mean_tau_ns(self) -> np.ndarray:
+        return np.array(
+            [item.tau_ns if item.accepted else np.nan for item in self.residue_fits], dtype=float
+        )
+
+    @property
+    def residue_sem_tau_ns(self) -> np.ndarray:
+        if self.residue_numbers is None:
+            return np.array([self.sem_tau_ns])
+        return np.array(
+            [self.standard_error(resnum=int(number)) for number in self.residue_numbers]
+        )
+
+    def report(self, *, max_rows: Optional[int] = None) -> str:
+        """Report aggregate parameters, bootstrap availability, and fit cautions."""
+        if max_rows is not None:
+            max_rows = _integer(max_rows, "max_rows", 1)
+        lines = [
+            f"Dataset: {self.dataset_label} | aggregation=aggregate | "
+            f"contributors={self.n_chains}/{self.n_total_chains} chains",
+            "Point estimates fit the mean correlation; errors are chain-bootstrap SEs.",
+            f"Bootstrap: {self.n_bootstrap_successful}/{len(self.bootstrap_fits)} "
+            f"numerically successful; {self.n_bootstrap_flagged} flagged; "
+            f"{self.n_bootstrap_requested} requested.",
+            "Model/window and chain selection are fixed; chain independence is assumed.",
+        ]
+        if self.n_chains < 2:
+            lines.append("Only one contributing chain: chain-bootstrap errors are undefined.")
+        if self.n_bootstrap_successful < len(self.bootstrap_fits):
+            lines.append(
+                "Numerical bootstrap failures retained: SE/CI are NaN; inspect bootstrap_fits."
+            )
+        if not self.bootstrap_fits and self.n_chains >= 2:
+            lines.append("No bootstrap performed: use n_bootstrap>=2 for standard errors.")
+
+        def append_fit(
+            title: str, item: ReconfigurationDecayFit, resnum: Optional[int] = None
+        ) -> None:
+            lines.append(
+                f"{title}: model={item.model}; status={item.status}; accepted={item.accepted}"
+            )
+            params = ["tau_ns", "amplitude"]
+            if item.model == "double":
+                params += ["tau_fast_ns", "tau_slow_ns", "fast_fraction"]
+            elif item.model == "stretched":
+                params += ["tau_scale_ns", "stretch_beta"]
+            for parameter in params:
+                estimate = float(getattr(item, parameter))
+                se = self.standard_error(parameter, resnum=resnum)
+                low, high = self.confidence_interval(parameter, resnum=resnum)
+                lines.append(
+                    f"  {parameter}={estimate:.6g}; bootstrap SE={se:.6g}; "
+                    f"{100*self.confidence_level:g}% percentile CI=[{low:.6g}, {high:.6g}]"
+                )
+            lines.append(
+                f"  window={item.fit_tmin_ns:g}..{item.fit_tmax_ns:g} ns; "
+                f"R2={item.r_squared:.5g}; RMSE={item.rmse:.5g}; "
+                f"tail={item.tail_fraction:.3g}; sensitivity={item.window_sensitivity:.3g}"
+            )
+            lines.append("  flags=" + (", ".join(item.flags) or "none"))
+
+        append_fit("Overall", self.fit)
+        if self.residue_numbers is not None:
+            for i, (number, item) in enumerate(zip(self.residue_numbers, self.residue_fits)):
+                if max_rows is not None and i >= max_rows:
+                    lines.append(f"... {len(self.residue_fits)-i} more residue fits")
+                    break
+                append_fit(f"Residue {number} (n={self.residue_n_chains[i]})", item, int(number))
+        return "\n".join(lines)
+
+
+def _aggregate_correlation_rows(data: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Equal-site means within each chain, with fixed site membership at all lags."""
+    rows = np.full((data.shape[0], data.shape[2]), np.nan)
+    for ci in range(data.shape[0]):
+        if np.any(mask[ci]):
+            # Ordinary mean intentionally propagates a missing lag. Do NOT change
+            # residue membership as a function of lag using nanmean.
+            rows[ci] = np.mean(data[ci, mask[ci], :], axis=0)
+    return rows
+
+
+def _fixed_chain_mean(rows: np.ndarray, used: np.ndarray) -> np.ndarray:
+    if not np.any(used):
+        return np.full(rows.shape[-1], np.nan)
+    return np.mean(rows[used], axis=0)
+
+
+def _fit_aggregate_correlations(
+    correlations: ReconfigurationCorrelationResult,
+    *,
+    fit_options: Mapping[str, Any],
+    model: str,
+    fit_tmin: float,
+    fit_tmax: float,
+    automatic_window: bool,
+    n_bootstrap: int,
+    random_seed: Optional[int],
+    confidence_level: float,
+    residue_averaging: str,
+    warn: bool,
+    report: bool,
+) -> ReconfigurationAggregateTimeResult:
+    """Aggregate cached ACFs before fitting; bootstrap complete chain curves."""
+    time = np.asarray(correlations.lag_time_ns, dtype=float)
+    data = np.asarray(correlations.correlation, dtype=float)
+    n_chains, n_sites, _ = data.shape
+    if n_chains < 1 or n_sites < 1:
+        raise ValueError("aggregate fitting requires at least one chain and site")
+    # Stable coverage is required on 0..requested endpoint, even for tail fits.
+    coverage = time <= fit_tmax
+    eligible = np.all(np.isfinite(data[:, :, coverage]), axis=2)
+    eligible &= np.isfinite(data[:, :, 0])
+    if correlations.kind == "torsions" and residue_averaging == "common":
+        common = np.all(eligible, axis=0)
+        if not np.any(common):
+            raise ValueError(
+                "no residue has finite correlations through the fitting window in "
+                "every selected chain; restrict the selection/window or use "
+                "residue_averaging='available' explicitly"
+            )
+        overall_mask = eligible & common[None, :]
+    else:
+        overall_mask = eligible.copy()
+    active = np.any(overall_mask, axis=1)
+    if not np.any(active):
+        raise ValueError("no chain has finite correlations throughout the fitting window")
+    pool = np.flatnonzero(np.any(eligible, axis=1))
+    if warn and (not np.all(eligible) or not np.all(active)):
+        warnings.warn(
+            "Aggregate fit uses fixed finite-data contributors, recorded in "
+            "overall_site_mask/residue_site_mask. Missing or constant sites are not "
+            "assigned zero correlation and contributors do not change with lag.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    rows = _aggregate_correlation_rows(data, overall_mask)
+    mean = _fixed_chain_mean(rows, active)
+    site_means = np.full((n_sites, len(time)), np.nan)
+    for ri in range(n_sites):
+        site_means[ri] = _fixed_chain_mean(data[:, ri, :], eligible[:, ri])
+    support = correlations.contiguous_time_per_site_ns
+    support = (
+        np.full((n_chains, n_sites), correlations.max_contiguous_time_ns)
+        if support is None
+        else np.asarray(support, dtype=float)
+    )
+    if support.shape != (n_chains, n_sites) or not np.all(np.isfinite(support[eligible])):
+        raise ValueError("invalid continuous-observation support metadata")
+    global_duration = float(np.min(support[overall_mask]))
+
+    def point_fit(curve: np.ndarray, duration: float) -> ReconfigurationDecayFit:
+        if not np.isfinite(curve[0]):
+            return _empty_fit(model, "missing_or_insufficient_data")
+        return _fit_one_automatic(
+            time,
+            curve,
+            model=model,
+            fit_tmin=fit_tmin,
+            fit_tmax=fit_tmax,
+            physical_dt=correlations.dt_ns * correlations.kinetic_scale,
+            duration=duration,
+            automatic_window=automatic_window,
+            **fit_options,
+        )
+
+    main = point_fit(mean, global_duration)
+    if correlations.kind == "torsions":
+        site_fits = tuple(
+            (
+                point_fit(site_means[ri], float(np.min(support[eligible[:, ri], ri])))
+                if np.any(eligible[:, ri])
+                else _empty_fit(model, "missing_or_insufficient_data")
+            )
+            for ri in range(n_sites)
+        )
+    else:
+        site_fits = (main,)
+    if correlations.kind != "torsions" and n_sites != 1:
+        raise ValueError("scalar aggregate input must have exactly one site")
+
+    # Bootstrap model and window are conditional on original aggregate choices.
+    raw_keys = (
+        "fit_amplitude",
+        "min_fit_points",
+        "min_r_squared",
+        "min_decay_times",
+        "min_observation_times",
+        "loss",
+        "f_scale",
+        "lag_weighting",
+        "max_fit_points",
+    )
+    raw_options = {key: fit_options[key] for key in raw_keys}
+
+    def bootstrap_fit(
+        curve: np.ndarray, point: ReconfigurationDecayFit, duration: float
+    ) -> ReconfigurationDecayFit:
+        if not point.optimizer_success:
+            return _empty_fit(point.model, "original_fit_failed")
+        if not np.isfinite(curve[0]):
+            return _empty_fit(point.model, "bootstrap_no_contributors")
+        item = _fit_one(
+            time,
+            curve,
+            model=point.model,
+            fit_tmin=point.fit_tmin_ns,
+            fit_tmax=point.fit_tmax_ns,
+            physical_dt=correlations.dt_ns * correlations.kinetic_scale,
+            duration=duration,
+            include_flagged=True,
+            **raw_options,
+        )
+        if item.optimizer_success:
+            tail = _model_tail_fraction(item, item.fit_tmax_ns)
+            flags = item.flags + (
+                ("excessive_tail_extrapolation",) if tail > fit_options["max_tail_fraction"] else ()
+            )
+            item = replace(
+                item,
+                tail_fraction=tail,
+                flags=tuple(dict.fromkeys(flags)),
+                window_method="fixed_bootstrap",
+                accepted=True,
+            )
+        return item
+
+    main_boot: list[ReconfigurationDecayFit] = []
+    site_boot: list[list[ReconfigurationDecayFit]] = [[] for _ in range(n_sites)]
+    draws = np.empty((0, len(pool)), dtype=np.int64)
+    if n_bootstrap and len(pool) >= 2:
+        rng = np.random.default_rng(random_seed)
+        draws = rng.choice(pool, size=(n_bootstrap, len(pool)), replace=True)
+        for indices in draws:
+            sampled_mean = _fixed_chain_mean(rows[indices], active[indices])
+            main_boot.append(bootstrap_fit(sampled_mean, main, global_duration))
+            if correlations.kind == "torsions":
+                for ri, point in enumerate(site_fits):
+                    sampled_site = _fixed_chain_mean(data[indices, ri, :], eligible[indices, ri])
+                    duration = (
+                        float(np.min(support[eligible[:, ri], ri]))
+                        if np.any(eligible[:, ri])
+                        else global_duration
+                    )
+                    site_boot[ri].append(bootstrap_fit(sampled_site, point, duration))
+        if correlations.kind != "torsions":
+            site_boot[0] = main_boot
+    elif n_bootstrap and warn:
+        warnings.warn(
+            "Chain-bootstrap uncertainty is undefined with one contributing chain; "
+            "the aggregate fit is returned with NaN SE/CI.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+    result = ReconfigurationAggregateTimeResult(
+        fit=main,
+        residue_fits=site_fits,
+        bootstrap_fits=tuple(main_boot),
+        residue_bootstrap_fits=tuple(tuple(items) for items in site_boot),
+        bootstrap_chain_indices=draws,
+        chain_labels=correlations.chain_labels,
+        residue_numbers=(
+            None if correlations.residue_numbers is None else correlations.residue_numbers.copy()
+        ),
+        observables=correlations.observables,
+        kind=correlations.kind,
+        model=model,
+        lag_time_ns=time.copy(),
+        overall_site_mask=overall_mask,
+        residue_site_mask=eligible,
+        aggregate_correlation=mean,
+        residue_aggregate_correlation=site_means,
+        residue_averaging=residue_averaging,
+        kinetic_scale=correlations.kinetic_scale,
+        source_frame_start=correlations.frame_start,
+        source_frame_stop=correlations.frame_stop,
+        source_dt_ns=correlations.dt_ns,
+        n_bootstrap_requested=n_bootstrap,
+        confidence_level=confidence_level,
+        dataset_label=correlations.dataset_label,
+    )
+    if warn:
+        failed = len(main_boot) - result.n_bootstrap_successful
+        profile_failed = sum(
+            not item.optimizer_success or not np.isfinite(item.tau_ns)
+            for items in site_boot
+            for item in items
+        )
+        if failed or (correlations.kind == "torsions" and profile_failed):
+            warnings.warn(
+                f"Numerical bootstrap failures: overall={failed}/{len(main_boot)}; "
+                f"site-level={profile_failed}. Replicates are retained; affected SE/CI "
+                "are NaN rather than silently excluding failures.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        if not main.accepted:
+            warnings.warn(
+                "Aggregate numerical fit is available in .fit but is not accepted "
+                "by the requested quality policy; inspect .fit.flags.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+    if report:
+        print(result.report())
+    return result
+
+
 def fit_reconfiguration_times(
     correlations: Any,
     *,
@@ -1411,8 +1909,34 @@ def fit_reconfiguration_times(
     max_fit_rmse: float = 0.08,
     quality_policy: str = "permissive",
     report: bool = False,
+    aggregation: str = "individual",
+    n_bootstrap: int = 0,
+    random_seed: Optional[int] = 0,
+    confidence_level: float = 0.95,
 ) -> Any:
     """Fit per-chain/site decays and summarize their amplitude-normalized areas.
+
+    aggregation="individual" (default) retains existing per-chain fits.
+    aggregation="aggregate" fits the equal-chain mean of normalized ACFs, not
+    the ACF of mean Rg and not the average of independently fitted parameters.
+    It returns ReconfigurationAggregateTimeResult, accepted by both plotters.
+    For torsions it fits the overall residue-then-chain average AND each
+    residue's chain mean. residue_averaging="common" uses the same finite-data
+    residues in every selected chain for the overall curve; "available" can
+    mix residue coverage. Fixed contributors must have finite ACFs over 0
+    through the requested endpoint (last saved lag when fit_tmax=None).
+
+    In aggregate mode n_bootstrap>=2 resamples whole chain curves with
+    replacement. The same draw is used across residues. SE is the sample SD
+    of replicate estimates, NOT SD/sqrt(n_bootstrap). Model and lag window
+    are fixed to the original aggregate choices, including with model="auto".
+    Percentile intervals are conditional on those choices. Flagged finite
+    estimates are retained; numerical failures cause affected SE/CI to be NaN.
+    n_bootstrap=0 gives only point estimates. One chain cannot provide chain-
+    bootstrap uncertainty. Bootstrap assumes independent chains and does not
+    correct temporal bias, within-condensate chain dependence, or core-selection
+    uncertainty. random_seed permits reproducible draws. n_bootstrap is not
+    supported in individual mode; existing per-chain SEMs remain unchanged.
 
     Default model='auto' compares single, stretched, and double exponentials.
     It keeps the simpler model unless the more complex model reduces the
@@ -1470,6 +1994,18 @@ def fit_reconfiguration_times(
     'available' can mix residue coverage and must be used with caution. All
     across-chain SD/SEM values remain NaN for fewer than two contributing chains.
     """
+    if aggregation not in {"individual", "aggregate"}:
+        raise ValueError("aggregation must be 'individual' or 'aggregate'")
+    n_bootstrap = _integer(n_bootstrap, "n_bootstrap", 0)
+    if n_bootstrap == 1:
+        raise ValueError("n_bootstrap must be 0 or >=2")
+    if aggregation == "individual" and n_bootstrap:
+        raise ValueError("n_bootstrap requires aggregation='aggregate'")
+    if random_seed is not None:
+        random_seed = _integer(random_seed, "random_seed", 0)
+    confidence_level = float(confidence_level)
+    if not np.isfinite(confidence_level) or not 0 < confidence_level < 1:
+        raise ValueError("confidence_level must be between 0 and 1")
     if isinstance(correlations, Mapping):
         if not correlations:
             raise ValueError("correlations mapping is empty")
@@ -1501,6 +2037,10 @@ def fit_reconfiguration_times(
                 max_fit_rmse=max_fit_rmse,
                 quality_policy=quality_policy,
                 report=report,
+                aggregation=aggregation,
+                n_bootstrap=n_bootstrap,
+                random_seed=random_seed,
+                confidence_level=confidence_level,
             )
             for key, value in correlations.items()
         }
@@ -1579,6 +2119,41 @@ def fit_reconfiguration_times(
     tmax = float(time[-1]) if fit_tmax is None else _time(fit_tmax, "fit_tmax")
     if not 0 <= tmin < tmax or tmax > time[-1] + 1e-10 * max(1, time[-1]):
         raise ValueError("fit limits must satisfy 0 <= fit_tmin < fit_tmax <= last saved lag")
+    if aggregation == "aggregate":
+        options = dict(
+            fit_amplitude=fit_amplitude,
+            min_fit_points=min_fit_points,
+            min_r_squared=min_r_squared,
+            min_decay_times=min_decay_times,
+            min_observation_times=min_observation_times,
+            include_flagged=include_flagged,
+            auto_cutoff=auto_cutoff,
+            loss=loss,
+            f_scale=f_scale,
+            lag_weighting=lag_weighting,
+            max_fit_points=max_fit_points,
+            check_stability=check_stability,
+            max_window_sensitivity=max_window_sensitivity,
+            max_tail_fraction=max_tail_fraction,
+            model_improvement=model_improvement,
+            min_model_improvement=min_model_improvement,
+            max_fit_rmse=max_fit_rmse,
+            quality_policy=quality_policy,
+        )
+        return _fit_aggregate_correlations(
+            correlations,
+            fit_options=options,
+            model=model,
+            fit_tmin=tmin,
+            fit_tmax=tmax,
+            automatic_window=bool(auto_window and fit_tmax is None),
+            n_bootstrap=n_bootstrap,
+            random_seed=random_seed,
+            confidence_level=confidence_level,
+            residue_averaging=residue_averaging,
+            warn=warn,
+            report=report,
+        )
     fits = {}
     tau_grid = np.full(data.shape[:2], np.nan)
     accepted = np.zeros(data.shape[:2], dtype=bool)
@@ -1752,8 +2327,7 @@ def _plot_items(data: Any, cls: type) -> list[tuple[str, Any]]:
     ):
         return [(f"series{i + 1}", item) for i, item in enumerate(data)]
     raise TypeError(
-        f"expected {cls.__name__}, a nonempty mapping of such results, "
-        "or a nonempty sequence of them"
+        f"expected {cls!r}, a nonempty mapping of such results, " "or a nonempty sequence of them"
     )
 
 
@@ -1839,6 +2413,11 @@ def plot_reconfiguration_correlations(
     mapping keys or in matching sequence order. A one-result fits object is
     also accepted for a one-result correlation input.
 
+    With aggregate fits, the solid curve uses exactly the fixed contributors
+    fitted by the aggregate result; the dashed curve is that ONE fitted decay.
+    Its parameters are available with show_fit_parameters=True. Correlation
+    shading remains pointwise across-chain SD/SEM, not a bootstrap fit band.
+
     colors and labels can be keyed mappings or ordered sequences. The fit line
     matches the corresponding correlation color by default. fit_labels can
     override auto-generated legend entries for fitted curves. legend=False
@@ -1860,8 +2439,18 @@ def plot_reconfiguration_correlations(
     else:
         fig = ax.figure
     items = _plot_items(correlations, ReconfigurationCorrelationResult)
-    fit_map = {} if fits is None else dict(_plot_items(fits, ReconfigurationTimeResult))
-    if fits is not None and len(items) == 1 and isinstance(fits, ReconfigurationTimeResult):
+    fit_map = (
+        {}
+        if fits is None
+        else dict(
+            _plot_items(fits, (ReconfigurationTimeResult, ReconfigurationAggregateTimeResult))
+        )
+    )
+    if (
+        fits is not None
+        and len(items) == 1
+        and isinstance(fits, (ReconfigurationTimeResult, ReconfigurationAggregateTimeResult))
+    ):
         fit_map = {items[0][0]: fits}
     if fits is not None and any(key not in fit_map for key, _ in items):
         raise KeyError("fits must have the same dataset keys as correlations")
@@ -1878,6 +2467,8 @@ def plot_reconfiguration_correlations(
         grid = np.asarray(raw.correlation, dtype=float)
         fit = fit_map.get(key)
         predictions = None
+        aggregate_item = None
+        aggregate_mode = isinstance(fit, ReconfigurationAggregateTimeResult)
         if fit is not None:
             if fit.chain_labels != raw.chain_labels or not np.array_equal(
                 fit.residue_numbers, raw.residue_numbers
@@ -1895,42 +2486,81 @@ def plot_reconfiguration_correlations(
                 or fit.source_dt_ns != raw.dt_ns
             ):
                 raise ValueError(f"{key}: fits and correlations have different source time windows")
-            mask = fit.accepted.copy()
-            if include_flagged_fits:
-                mask = np.asarray(
-                    [
-                        [item.optimizer_success for item in fit.fits[chain]]
-                        for chain in raw.chain_labels
-                    ],
-                    dtype=bool,
-                )
-            if (
-                not include_flagged_fits
-                and site is None
-                and fit.kind == "torsions"
-                and fit.residue_averaging == "common"
-            ):
-                mask &= np.isin(raw.residue_numbers, fit.summary_residue_numbers)[None, :]
-            has_selected_fit = np.any(mask) if site is None else np.any(mask[:, site])
-            if has_selected_fit:
-                grid = np.where(mask[:, :, None], grid, np.nan)
+        if aggregate_mode:
+            if not np.array_equal(fit.lag_time_ns, raw.lag_time_ns):
+                raise ValueError(f"{key}: aggregate fit and correlation have different lag grids")
+            if site is None:
+                rows = _aggregate_correlation_rows(grid, fit.overall_site_mask)
+                rows = rows[np.any(fit.overall_site_mask, axis=1)]
+                expected_mean = fit.aggregate_correlation
+                aggregate_item = fit.fit
             else:
+                rows = grid[fit.residue_site_mask[:, site], site, :]
+                expected_mean = fit.residue_aggregate_correlation[site]
+                aggregate_item = fit.residue_fits[site]
+            if len(rows):
+                mean_check = np.mean(rows, axis=0)
+                if not np.allclose(mean_check, expected_mean, equal_nan=True):
+                    raise ValueError(
+                        f"{key}: input correlation values changed since aggregate fitting"
+                    )
+            if not (
+                aggregate_item.accepted
+                or (include_flagged_fits and aggregate_item.optimizer_success)
+            ):
                 warnings.warn(
-                    f"{key}: no accepted fits; showing the original correlation without "
-                    "a fitted overlay. Set include_flagged_fits=True for diagnostics.",
+                    f"{key}: aggregate fit is not accepted; showing the mean correlation "
+                    "without its fit. Use include_flagged_fits=True to inspect it.",
                     RuntimeWarning,
                     stacklevel=2,
                 )
-            predictions = np.full_like(grid, np.nan)
-            for ci, chain in enumerate(raw.chain_labels):
-                for ri, item in enumerate(fit.fits[chain]):
-                    if mask[ci, ri]:
-                        in_window = (raw.lag_time_ns >= item.fit_tmin_ns) & (
-                            raw.lag_time_ns <= item.fit_tmax_ns
-                        )
-                        predictions[ci, ri, in_window] = item.predict(raw.lag_time_ns[in_window])
-        rows = _stats(grid, axis=1)[0] if site is None else grid[:, site, :]
+                aggregate_item = None
+        else:
+            if fit is not None:
+                mask = fit.accepted.copy()
+                if include_flagged_fits:
+                    mask = np.asarray(
+                        [
+                            [item.optimizer_success for item in fit.fits[chain]]
+                            for chain in raw.chain_labels
+                        ],
+                        dtype=bool,
+                    )
+                if (
+                    not include_flagged_fits
+                    and site is None
+                    and fit.kind == "torsions"
+                    and fit.residue_averaging == "common"
+                ):
+                    mask &= np.isin(raw.residue_numbers, fit.summary_residue_numbers)[None, :]
+                has_selected_fit = np.any(mask) if site is None else np.any(mask[:, site])
+                if has_selected_fit:
+                    grid = np.where(mask[:, :, None], grid, np.nan)
+                else:
+                    warnings.warn(
+                        f"{key}: no accepted fits; showing the original correlation without "
+                        "a fitted overlay. Set include_flagged_fits=True for diagnostics.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                predictions = np.full_like(grid, np.nan)
+                for ci, chain in enumerate(raw.chain_labels):
+                    for ri, item in enumerate(fit.fits[chain]):
+                        if mask[ci, ri]:
+                            in_window = (raw.lag_time_ns >= item.fit_tmin_ns) & (
+                                raw.lag_time_ns <= item.fit_tmax_ns
+                            )
+                            predictions[ci, ri, in_window] = item.predict(
+                                raw.lag_time_ns[in_window]
+                            )
+            rows = _stats(grid, axis=1)[0] if site is None else grid[:, site, :]
         mean, sd, sem, _ = _stats(rows, axis=0)
+        if aggregate_mode:
+            # Preserve NaN at lags missing from any of the fixed contributors.
+            incomplete = (
+                ~np.all(np.isfinite(rows), axis=0) if len(rows) else np.ones(len(mean), bool)
+            )
+            mean[incomplete] = sd[incomplete] = sem[incomplete] = np.nan
         x = raw.lag_time_ns * factor
         good = np.isfinite(mean)
         if xscale == "log":
@@ -1959,25 +2589,35 @@ def plot_reconfiguration_correlations(
                 if yscale == "log":
                     keep &= row > 0
                 ax.plot(x[keep], row[keep], alpha=0.25, linewidth=0.7, color=color)
-        if predictions is not None:
+        prediction_mean = None
+        used = []
+        if aggregate_item is not None:
+            prediction_mean = np.full_like(raw.lag_time_ns, np.nan, dtype=float)
+            in_window = (raw.lag_time_ns >= aggregate_item.fit_tmin_ns) & (
+                raw.lag_time_ns <= aggregate_item.fit_tmax_ns
+            )
+            prediction_mean[in_window] = aggregate_item.predict(raw.lag_time_ns[in_window])
+            used = [aggregate_item]
+        elif predictions is not None:
             prediction_rows = (
                 _stats(predictions, axis=1)[0] if site is None else predictions[:, site, :]
             )
             prediction_mean = _stats(prediction_rows, axis=0)[0]
+            used = [
+                item
+                for chain in raw.chain_labels
+                for ri, item in enumerate(fit.fits[chain])
+                if (site is None or ri == site)
+                and (item.accepted or (include_flagged_fits and item.optimizer_success))
+            ]
+        if prediction_mean is not None:
             keep = np.isfinite(prediction_mean) & ((x > 0) if xscale == "log" else True)
             if yscale == "log":
                 keep &= prediction_mean > 0
             if np.any(keep):
-                used = [
-                    item
-                    for chain in raw.chain_labels
-                    for ri, item in enumerate(fit.fits[chain])
-                    if (site is None or ri == site)
-                    and (item.accepted or (include_flagged_fits and item.optimizer_success))
-                ]
                 models = "/".join(sorted({item.model for item in used}))
                 suffix = " (includes flagged)" if any(not item.accepted for item in used) else ""
-                fit_label = f"{label}: {models} fit{suffix}"
+                fit_label = f"{label}: {models} {'aggregate ' if aggregate_mode else ''}fit{suffix}"
                 if show_fit_parameters and len(used) == 1:
                     item = used[0]
                     if item.model == "double":
@@ -2061,6 +2701,9 @@ def plot_reconfiguration_times(
     inspect residue_n_chains when comparing profiles. For one chain the point
     is plotted with no error bar, because chain variation is not estimable.
     xlabel/ylabel optionally override the default axis labels.
+    Aggregate results plot per-residue aggregate parameters. uncertainty='sem'
+    means chain-bootstrap SE in that mode; 'std' and show_chains=True are not
+    defined because individual-chain fitted times are not calculated.
     Multiple result mappings or ordered sequences are accepted; colors/labels
     can be keyed mappings or sequences in the corresponding dataset order.
     """
@@ -2073,9 +2716,22 @@ def plot_reconfiguration_times(
     else:
         fig = ax.figure
     plotted = False
-    for dataset_index, (key, fit) in enumerate(_plot_items(fits, ReconfigurationTimeResult)):
+    for dataset_index, (key, fit) in enumerate(
+        _plot_items(fits, (ReconfigurationTimeResult, ReconfigurationAggregateTimeResult))
+    ):
         if fit.residue_numbers is None:
             raise ValueError("residue profiles require torsion fits, not scalar/Rg fits")
+        aggregate_mode = isinstance(fit, ReconfigurationAggregateTimeResult)
+        if aggregate_mode and show_chains:
+            raise ValueError(
+                "aggregate fits have no individual-chain fitted times; "
+                "use show_chains=False or fit aggregation='individual'"
+            )
+        if aggregate_mode and uncertainty == "std":
+            raise ValueError(
+                "aggregate profiles provide bootstrap SE, not across-chain SD; "
+                "use uncertainty='sem' or None"
+            )
         # Sort residue numbers for line plots; explicit analysis ordering may differ.
         order = np.argsort(fit.residue_numbers)
         x = fit.residue_numbers[order]
