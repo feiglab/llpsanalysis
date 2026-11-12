@@ -5285,6 +5285,7 @@ def plot_2d_histogram(
     If data is a Histogram2DResult, its precomputed histogram is plotted directly.
     """
     from matplotlib.colors import LogNorm, Normalize
+    from matplotlib.ticker import FuncFormatter
 
     if isinstance(data, Histogram2DResult):
         hist = data
@@ -5331,7 +5332,10 @@ def plot_2d_histogram(
         lo = float(np.min(positives)) if vmin is None else float(vmin)
         hi = float(np.max(positives)) if vmax is None else float(vmax)
         if hi <= lo and vmin is None and vmax is None:
-            hi = lo * (1.0 + 1.0e-8)
+            # When every populated bin has the same value, a nearly zero-width
+            # LogNorm produces unreadable ticks and practically identical levels.
+            # Show one decade below the observed value instead.
+            lo = hi / 10.0
         if lo <= 0.0 or hi <= lo:
             raise ValueError("log scale requires 0 < vmin < vmax")
         color_norm = LogNorm(vmin=lo, vmax=hi)
@@ -5340,7 +5344,14 @@ def plot_2d_histogram(
         lo = float(np.min(finite)) if vmin is None else float(vmin)
         hi = float(np.max(finite)) if vmax is None else float(vmax)
         if hi <= lo and vmin is None and vmax is None:
-            hi = lo + max(1.0e-12, abs(lo) * 1.0e-8)
+            # A constant nonnegative histogram is most clearly shown from zero.
+            # Constant negative generic data are expanded around their value.
+            if hi > 0.0:
+                lo = 0.0
+            elif hi == 0.0:
+                hi = 1.0
+            else:
+                hi = lo + max(1.0e-12, abs(lo) * 0.1)
         if hi <= lo:
             raise ValueError("linear scale requires vmin < vmax")
         color_norm = Normalize(vmin=lo, vmax=hi)
@@ -5396,6 +5407,43 @@ def plot_2d_histogram(
         cb_kwargs = {} if colorbar_kwargs is None else dict(colorbar_kwargs)
         if colorbar_ticks is not None:
             cb_kwargs["ticks"] = colorbar_ticks
+        elif "ticks" not in cb_kwargs:
+            # Matplotlib's automatic LogFormatter often labels only one or two
+            # contour boundaries when the range is narrower than a few decades.
+            # Explicitly choose five ticks in the visible color range instead.
+            lower = float(boundaries[0]) if style_name != "pcolormesh" else lo
+            upper = float(boundaries[-1]) if style_name != "pcolormesh" else hi
+            cb_kwargs["ticks"] = (
+                np.geomspace(lower, upper, 5) if scale == "log" else np.linspace(lower, upper, 5)
+            )
+        if "format" not in cb_kwargs:
+            # Use concise, always-visible scientific notation for small densities.
+            # Preserve Matplotlib's own formatting if the caller supplies a
+            # tick Locator rather than a sequence of numeric positions.
+            try:
+                tick_positions = np.asarray(cb_kwargs["ticks"], dtype=float).ravel()
+            except (TypeError, ValueError):
+                tick_positions = np.asarray([], dtype=float)
+            finite_ticks = tick_positions[np.isfinite(tick_positions)]
+            if finite_ticks.size:
+                unique_ticks = np.sort(np.unique(finite_ticks))
+                scale_value = max(float(np.max(np.abs(finite_ticks))), 1e-300)
+                if unique_ticks.size > 1:
+                    spacing = float(np.min(np.diff(unique_ticks)))
+                    # More significant figures for a tight user-defined range.
+                    significant = max(3, min(9, int(np.ceil(-np.log10(spacing / scale_value))) + 2))
+                else:
+                    significant = 3
+                use_scientific = scale_value < 1.0e-3 or scale_value >= 1.0e4
+
+                def _tick_format(value: float, _position: int) -> str:
+                    if value == 0.0:
+                        return "0"
+                    if use_scientific:
+                        return f"{value:.{significant - 1}e}"
+                    return f"{value:.{significant}g}"
+
+                cb_kwargs["format"] = FuncFormatter(_tick_format)
         cb = fig.colorbar(artist, ax=ax, **cb_kwargs)
         default_label = {
             "density": "Probability density",
