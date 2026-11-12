@@ -31,7 +31,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.ticker import MaxNLocator
 from scipy.fft import irfft, next_fast_len, rfft
+from scipy.ndimage import median_filter
 from scipy.optimize import least_squares
+from scipy.special import gamma, gammaincc
 
 __all__ = [
     "ReconfigurationCorrelationResult",
@@ -163,8 +165,12 @@ class ReconfigurationCorrelationResult:
 class ReconfigurationDecayFit:
     """One fit; flagged numerical estimates are retained but not accepted by default.
 
-    tau_ns is tau for a single exponential, or the amplitude-weighted mean
-    fast_fraction*tau_fast_ns + (1-fast_fraction)*tau_slow_ns for a biexponential.
+    tau_ns is the amplitude-normalized fitted integral. It is tau for a single
+    exponential, fast_fraction*tau_fast_ns+(1-fast_fraction)*tau_slow_ns for a
+    double exponential, and tau_scale_ns*Gamma(1+1/stretch_beta) for a stretched
+    exponential. A stretched fit has NaN fast/slow times and fast_fraction.
+    flags includes cautions; rejection_flags identifies summary-excluding flags.
+    window_sensitivity is a fit-window diagnostic, not a sampling uncertainty.
     The model is A*[f exp(-t/tau_fast)+(1-f) exp(-t/tau_slow)], with no offset.
     A defaults to 1. A fitted A is an extrapolated tail amplitude, not a new
     normalization of the measured ACF. No independent-data covariance error
@@ -185,11 +191,36 @@ class ReconfigurationDecayFit:
     optimizer_success: bool
     accepted: bool
     flags: tuple[str, ...]
+    tau_scale_ns: float = float("nan")
+    stretch_beta: float = 1.0
+    weighted_rmse: float = float("nan")
+    selection_score: float = float("nan")
+    tail_fraction: float = float("nan")
+    window_sensitivity: float = float("nan")
+    window_tmax_ns: tuple[float, ...] = ()
+    window_tau_ns: tuple[float, ...] = ()
+    candidate_models: tuple[str, ...] = ()
+    candidate_scores: tuple[float, ...] = ()
+    rejection_flags: tuple[str, ...] = ()
+    window_method: str = "manual"
+
+    @property
+    def status(self) -> str:
+        """Numerical status; 'ok' does not establish trajectory convergence."""
+        if not self.optimizer_success:
+            return "failed"
+        if not self.accepted:
+            return "unresolved"
+        return "warning" if self.flags else "ok"
 
     def predict(self, time_ns: Any) -> np.ndarray:
         time = np.asarray(time_ns, dtype=float)
         if not self.optimizer_success:
             return np.full_like(time, np.nan)
+        if self.model == "stretched":
+            return self.amplitude * np.exp(
+                -np.power(np.maximum(time, 0.0) / self.tau_scale_ns, self.stretch_beta)
+            )
         return self.amplitude * (
             self.fast_fraction * np.exp(-time / self.tau_fast_ns)
             + (1.0 - self.fast_fraction) * np.exp(-time / self.tau_slow_ns)
@@ -773,6 +804,80 @@ def _empty_fit(model: str, reason: str) -> ReconfigurationDecayFit:
         optimizer_success=False,
         accepted=False,
         flags=(reason,),
+        rejection_flags=(reason,),
+    )
+
+
+def _fit_weights(time: np.ndarray, mode: str) -> np.ndarray:
+    """Quadrature weights, not inverse statistical variances of lag estimates."""
+    if len(time) < 2 or mode == "uniform":
+        return np.ones(len(time), dtype=float)
+
+    def widths(values: np.ndarray) -> np.ndarray:
+        mid = 0.5 * (values[1:] + values[:-1])
+        return np.diff(np.r_[values[0], mid, values[-1]])
+
+    linear = widths(time)
+    linear /= linear.sum()
+    positive = time[time > 0]
+    offset = float(positive[0]) if positive.size else 1.0
+    logarithmic = widths(np.log1p(time / offset))
+    logarithmic /= logarithmic.sum()
+    weights = 0.5 * (linear + logarithmic)
+    return weights * len(weights)
+
+
+def _automatic_fit_end(
+    time: np.ndarray,
+    curve: np.ndarray,
+    first: float,
+    cutoff: float,
+    min_fit_points: int,
+) -> tuple[float, str]:
+    """Use a sustained near-zero region, not an isolated crossing, as an endpoint.
+
+    Smoothing is ONLY for window detection. Raw signed correlations are fitted.
+    The cutoff is an operational threshold, not an estimated noise confidence
+    interval. Significant later positive recovery prevents premature truncation.
+    """
+    keep = np.isfinite(curve) & (time >= first)
+    x, y = time[keep], curve[keep]
+    if len(x) < max(2, min_fit_points):
+        return float(time[-1]), "available_lags"
+    size = min(101, max(3, 2 * (len(x) // 200) + 1))
+    smooth = median_filter(y, size=size, mode="nearest")
+    hold = max(3, int(math.ceil(len(x) * 0.015)))
+    low = smooth <= cutoff
+    # A short excursion into zero followed by a clear recovery is not a tail.
+    high = smooth > max(0.10, 3.0 * cutoff)
+    high_cumulative = np.r_[0, np.cumsum(high, dtype=np.int64)]
+    high_runs = high_cumulative[hold:] - high_cumulative[:-hold]
+    last_recovery = np.flatnonzero(high_runs == hold)
+    after = int(last_recovery[-1] + hold) if last_recovery.size else 0
+    low_cumulative = np.r_[0, np.cumsum(low, dtype=np.int64)]
+    runs = low_cumulative[hold:] - low_cumulative[:-hold]
+    candidates = np.flatnonzero(runs == hold)
+    candidates = candidates[(candidates >= after) & (candidates + hold >= min_fit_points)]
+    if candidates.size:
+        end = min(len(x) - 1, int(candidates[0] + hold - 1))
+        return float(x[end]), "sustained_near_zero"
+    return float(x[-1]), "available_lags"
+
+
+def _model_tail_fraction(fit: ReconfigurationDecayFit, time: float) -> float:
+    """Fraction of the normalized fitted correlation area beyond time."""
+    if not fit.optimizer_success or not np.isfinite(fit.tau_ns) or fit.tau_ns <= 0:
+        return float("nan")
+    if fit.model == "stretched":
+        z = (max(0.0, time) / fit.tau_scale_ns) ** fit.stretch_beta
+        return float(gammaincc(1.0 / fit.stretch_beta, z))
+    f = fit.fast_fraction
+    return float(
+        (
+            f * fit.tau_fast_ns * np.exp(-time / fit.tau_fast_ns)
+            + (1.0 - f) * fit.tau_slow_ns * np.exp(-time / fit.tau_slow_ns)
+        )
+        / fit.tau_ns
     )
 
 
@@ -791,37 +896,73 @@ def _fit_one(
     min_decay_times: float,
     min_observation_times: float,
     include_flagged: bool,
+    loss: str = "soft_l1",
+    f_scale: float = 0.05,
+    lag_weighting: str = "balanced",
+    max_fit_points: int = 512,
 ) -> ReconfigurationDecayFit:
     valid = np.isfinite(correlation) & (time >= fit_tmin) & (time <= fit_tmax)
-    x, y = time[valid], correlation[valid]
-    n_parameters = (1 if model == "single" else 3) + int(fit_amplitude)
-    if x.size < max(min_fit_points, n_parameters + 2):
+    all_x, all_y = time[valid], correlation[valid]
+    n_parameters = {"single": 1, "stretched": 2, "double": 3}[model] + int(fit_amplitude)
+    if len(all_x) < max(min_fit_points, n_parameters + 2):
         return _empty_fit(model, "insufficient_fit_points")
-    if not np.any((x > 0) & (y > 0)):
+    if not np.any((all_x > 0) & (all_y > 0)):
         return _empty_fit(model, "unresolved_at_sample_spacing")
-    # Normalize times for the optimizer, but report ns. Fit in correlation space,
-    # never log(C): negative/noisy values are retained, not silently clipped.
+    # Bounded deterministic sampling limits optimization cost on dense lag grids.
+    # The union retains both early fast relaxation and the late slow tail.
+    if len(all_x) > max_fit_points:
+        half = max_fit_points // 2
+        choose = np.unique(
+            np.r_[
+                np.linspace(0, len(all_x) - 1, half).astype(int),
+                (np.geomspace(1, len(all_x), half) - 1).astype(int),
+            ]
+        )
+        required = max(min_fit_points, n_parameters + 2)
+        if choose.size < required:
+            choose = np.linspace(0, len(all_x) - 1, max_fit_points).astype(int)
+        x, y = all_x[choose], all_y[choose]
+        # Preserve the weighting measure on the ORIGINAL lag grid even when
+        # representative optimization samples are nonuniformly spaced.
+        assignment = np.searchsorted(0.5 * (x[1:] + x[:-1]), all_x)
+        weights = np.bincount(
+            assignment,
+            weights=_fit_weights(all_x, lag_weighting),
+            minlength=len(x),
+        )
+        weights *= len(weights) / weights.sum()
+    else:
+        x, y = all_x, all_y
+        weights = _fit_weights(x, lag_weighting)
+    sqrt_weights = np.sqrt(weights)
     scale = max(float(x[-1]), physical_dt)
     u = x / scale
     low = physical_dt / scale / 100.0
     high = max(duration, float(x[-1]), physical_dt) / scale * 100.0
     below = np.flatnonzero((x > 0) & (y <= math.exp(-1)))
-    guess = float(x[below[0]]) / scale if below.size else max(1.0, float(x[-1]) / scale)
+    guess = float(x[below[0]]) / scale if below.size else 1.0
     guess = float(np.clip(guess, low * 10, high / 10))
 
-    def prediction(parameters: np.ndarray) -> np.ndarray:
+    def prediction(parameters: np.ndarray, times: np.ndarray = u) -> np.ndarray:
         if model == "single":
-            decay = np.exp(-u / np.exp(parameters[0]))
+            decay = np.exp(-times / np.exp(parameters[0]))
+        elif model == "stretched":
+            decay = np.exp(-np.power(times / np.exp(parameters[0]), parameters[1]))
         else:
             tau1, tau2 = np.exp(parameters[:2])
             fraction = parameters[2]
-            decay = fraction * np.exp(-u / tau1) + (1 - fraction) * np.exp(-u / tau2)
+            decay = fraction * np.exp(-times / tau1) + (1 - fraction) * np.exp(-times / tau2)
         amplitude = parameters[-1] if fit_amplitude else 1.0
         return amplitude * decay
 
     if model == "single":
-        initial = [[math.log(guess)]]
+        initial = [
+            [math.log(np.clip(guess * factor, low * 2, high / 2))] for factor in (0.3, 1.0, 3.0)
+        ]
         lower, upper = [math.log(low)], [math.log(high)]
+    elif model == "stretched":
+        initial = [[math.log(guess), beta] for beta in (0.45, 0.7, 0.95)]
+        lower, upper = [math.log(low), 0.2], [math.log(high), 1.0]
     else:
         initial = []
         for ratio in (3.0, 10.0, 30.0):
@@ -833,23 +974,32 @@ def _fit_one(
                         fraction,
                     ]
                 )
-        lower, upper = [math.log(low), math.log(low), 0.001], [
-            math.log(high),
-            math.log(high),
-            0.999,
-        ]
+        lower = [math.log(low), math.log(low), 0.001]
+        upper = [math.log(high), math.log(high), 0.999]
     if fit_amplitude:
-        initial = [item + [1.0] for item in initial]
+        amplitude_guess = float(np.clip(np.max(y), 0.01, 1.9))
+        initial = [item + [amplitude_guess] for item in initial]
         lower += [0.001]
         upper += [2.0]
     best = None
+
+    # The loss acts on raw C residuals, then quadrature weights are applied.
+    # Applying weights before a nonlinear loss would alter its outlier cutoff.
+    def residual(parameters: np.ndarray) -> np.ndarray:
+        difference = prediction(parameters) - y
+        if loss == "soft_l1":
+            z = difference / f_scale
+            # Stable signed square root of the soft_l1 loss, incl. small z.
+            difference = difference * np.sqrt(2.0 / (np.sqrt(1.0 + z * z) + 1.0))
+        return sqrt_weights * difference
+
     for guess_values in initial:
         try:
             solution = least_squares(
-                lambda p: prediction(p) - y,
+                residual,
                 guess_values,
                 bounds=(lower, upper),
-                max_nfev=4000,
+                max_nfev=2000,
                 ftol=1e-10,
                 xtol=1e-10,
                 gtol=1e-10,
@@ -863,9 +1013,18 @@ def _fit_one(
         return _empty_fit(model, "optimizer_failed")
     p = best.x
     amplitude = float(p[-1]) if fit_amplitude else 1.0
-    if model == "single":
-        tau_fast = tau_slow = float(np.exp(p[0]) * scale)
+    beta = float(p[1]) if model == "stretched" else 1.0
+    tau_scale = float(np.exp(p[0]) * scale)
+    if model == "stretched":
+        tau = float(tau_scale * gamma(1.0 + 1.0 / beta))
+        tau_fast = tau_slow = float("nan")
+        fast_fraction = float("nan")
+        slow_diagnostic = tau
+        fast_diagnostic = tau_scale
+    elif model == "single":
+        tau_fast = tau_slow = tau = tau_scale
         fast_fraction = 1.0
+        slow_diagnostic = fast_diagnostic = tau
     else:
         tau_fast, tau_slow = np.exp(p[:2]) * scale
         fast_fraction = float(p[2])
@@ -873,21 +1032,35 @@ def _fit_one(
             tau_fast, tau_slow = tau_slow, tau_fast
             fast_fraction = 1 - fast_fraction
         tau_fast, tau_slow = float(tau_fast), float(tau_slow)
-    tau = fast_fraction * tau_fast + (1 - fast_fraction) * tau_slow
-    residual = prediction(p) - y
-    ss = float(np.sum(residual**2))
-    total = float(np.sum((y - np.mean(y)) ** 2))
+        tau = fast_fraction * tau_fast + (1 - fast_fraction) * tau_slow
+        tau_scale = float("nan")
+        slow_diagnostic, fast_diagnostic = tau_slow, tau_fast
+    differences = prediction(p, all_x / scale) - all_y
+    ss = float(np.sum(differences**2))
+    total = float(np.sum((all_y - np.mean(all_y)) ** 2))
     r2 = 1 - ss / total if total > 1e-20 else float("nan")
+    # Identical evaluation grid for all candidate models; no log(C) or dropping
+    # negative observations. These scores are descriptive, NOT likelihoods.
+    eval_weights = _fit_weights(all_x, lag_weighting)
+    weighted_rmse = float(np.sqrt(np.average(differences**2, weights=eval_weights)))
+    robust_error = differences
+    if loss == "soft_l1":
+        z = differences / f_scale
+        robust_error = differences * np.sqrt(2.0 / (np.sqrt(1.0 + z * z) + 1.0))
+    score = float(np.sqrt(np.average(robust_error**2, weights=eval_weights)))
     flags = []
     if min_r_squared is not None and (not np.isfinite(r2) or r2 < min_r_squared):
         flags.append("poor_single_decay_fit" if model == "single" else "poor_decay_fit")
-    if tau_fast < physical_dt:
+    if fast_diagnostic < physical_dt:
         flags.append("faster_than_sampling")
-    if float(x[-1] - x[0]) < min_decay_times * tau_slow:
+    if float(all_x[-1] - all_x[0]) < min_decay_times * slow_diagnostic:
         flags.append("insufficient_decay_window")
-    if duration < min_observation_times * tau_slow:
+    if duration < min_observation_times * slow_diagnostic:
         flags.append("too_few_relaxation_times")
-    if np.any(best.active_mask != 0):
+    active = best.active_mask.copy()
+    if model == "stretched" and active[1] == 1:
+        active[1] = 0  # beta=1 is a valid single exponential, not an invalid bound.
+    if np.any(active != 0):
         flags.append("parameter_at_bound")
     try:
         condition = float(np.linalg.cond(best.jac))
@@ -908,13 +1081,123 @@ def _fit_one(
         fast_fraction=fast_fraction,
         amplitude=amplitude,
         r_squared=float(r2),
-        rmse=math.sqrt(ss / len(y)),
-        n_points=len(y),
-        fit_tmin_ns=float(x[0]),
-        fit_tmax_ns=float(x[-1]),
+        rmse=math.sqrt(ss / len(all_y)),
+        n_points=len(x),
+        fit_tmin_ns=float(all_x[0]),
+        fit_tmax_ns=float(all_x[-1]),
         optimizer_success=True,
         accepted=not flags or bool(include_flagged),
         flags=tuple(flags),
+        tau_scale_ns=tau_scale,
+        stretch_beta=beta,
+        weighted_rmse=weighted_rmse,
+        selection_score=score,
+    )
+
+
+def _fit_one_automatic(
+    time: np.ndarray,
+    curve: np.ndarray,
+    *,
+    model: str,
+    fit_tmax: float,
+    automatic_window: bool,
+    auto_cutoff: float,
+    check_stability: bool,
+    max_tail_fraction: float,
+    max_window_sensitivity: float,
+    quality_policy: str,
+    model_improvement: float,
+    min_model_improvement: float,
+    max_fit_rmse: float,
+    **kwargs: Any,
+) -> ReconfigurationDecayFit:
+    end = fit_tmax
+    window_method = "manual"
+    if automatic_window:
+        end, window_method = _automatic_fit_end(
+            time,
+            curve,
+            kwargs["fit_tmin"],
+            auto_cutoff,
+            kwargs["min_fit_points"],
+        )
+    names = ("single", "stretched", "double") if model == "auto" else (model,)
+    candidates = [_fit_one(time, curve, model=name, fit_tmax=end, **kwargs) for name in names]
+    usable = [item for item in candidates if item.optimizer_success]
+    if not usable:
+        return replace(candidates[0], window_method=window_method)
+    chosen = usable[0]
+    for item in usable[1:]:
+        improvement = chosen.selection_score - item.selection_score
+        if improvement > max(min_model_improvement, model_improvement * chosen.selection_score):
+            chosen = item
+    chosen = replace(
+        chosen,
+        window_method=window_method,
+        candidate_models=names,
+        candidate_scores=tuple(item.selection_score for item in candidates),
+    )
+    flags = list(chosen.flags)
+    tail = _model_tail_fraction(chosen, chosen.fit_tmax_ns)
+    if tail > max_tail_fraction:
+        flags.append("excessive_tail_extrapolation")
+    # A positive relaxation model cannot account for a large sustained negative
+    # lobe. Small negative tails (as in noisy finite ACFs) are not clipped.
+    valid = np.isfinite(curve)
+    negative_end = (
+        min(float(time[-1]), chosen.fit_tmax_ns * 1.5) if automatic_window else chosen.fit_tmax_ns
+    )
+    negative = curve[valid & (time >= kwargs["fit_tmin"]) & (time <= negative_end)]
+    if len(negative) >= 5:
+        smooth = median_filter(negative, size=5, mode="nearest")
+        hold = max(3, min(21, int(math.ceil(len(negative) * 0.015))))
+        runs = np.convolve((smooth < -0.1).astype(int), np.ones(hold, int), mode="valid")
+        if np.any(runs == hold):
+            flags.append("substantial_negative_lobe")
+    window_ends = [chosen.fit_tmax_ns]
+    window_taus = [chosen.tau_ns]
+    if check_stability:
+        start = kwargs["fit_tmin"]
+        for factor in (0.8, 1.2):
+            trial_end = min(float(time[-1]), start + factor * (chosen.fit_tmax_ns - start))
+            if any(
+                math.isclose(trial_end, value, rel_tol=1e-8, abs_tol=1e-12) for value in window_ends
+            ):
+                continue
+            alternative = _fit_one(time, curve, model=chosen.model, fit_tmax=trial_end, **kwargs)
+            if alternative.optimizer_success and alternative.tau_ns > 0:
+                window_ends.append(alternative.fit_tmax_ns)
+                window_taus.append(alternative.tau_ns)
+    sensitivity = (
+        max(abs(value / chosen.tau_ns - 1.0) for value in window_taus)
+        if len(window_taus) > 1
+        else float("nan")
+    )
+    if np.isfinite(sensitivity) and sensitivity > max_window_sensitivity:
+        flags.append("window_sensitive")
+    if chosen.selection_score > max_fit_rmse:
+        flags.append("large_fit_residual")
+    flags = tuple(dict.fromkeys(flags))
+    # Legacy R-squared and sampling/coverage gates are cautions under standard
+    # policy. Measurable tail extrapolation is checked directly instead of
+    # rejecting every multiscale fit whose slow component exceeds span/2.
+    advisory = {
+        "insufficient_decay_window",
+        "too_few_relaxation_times",
+        "poor_single_decay_fit",
+        "poor_decay_fit",
+    }
+    rejected = flags if quality_policy == "strict" else tuple(f for f in flags if f not in advisory)
+    return replace(
+        chosen,
+        flags=flags,
+        rejection_flags=rejected,
+        accepted=(not rejected or bool(kwargs["include_flagged"])),
+        tail_fraction=tail,
+        window_sensitivity=sensitivity,
+        window_tmax_ns=tuple(window_ends),
+        window_tau_ns=tuple(window_taus),
     )
 
 
@@ -923,7 +1206,7 @@ def fit_reconfiguration_times(
     *,
     fit_tmin: Any = 0.0,
     fit_tmax: Any = None,
-    model: str = "single",
+    model: str = "auto",
     fit_amplitude: bool = False,
     min_fit_points: int = 8,
     min_r_squared: Optional[float] = 0.8,
@@ -932,45 +1215,74 @@ def fit_reconfiguration_times(
     include_flagged: bool = False,
     residue_averaging: str = "common",
     warn: bool = True,
+    auto_window: bool = True,
+    auto_cutoff: float = 0.02,
+    loss: str = "soft_l1",
+    f_scale: float = 0.05,
+    lag_weighting: str = "balanced",
+    max_fit_points: int = 512,
+    check_stability: bool = True,
+    max_window_sensitivity: float = 0.35,
+    max_tail_fraction: float = 0.20,
+    model_improvement: float = 0.20,
+    min_model_improvement: float = 0.005,
+    max_fit_rmse: float = 0.08,
+    quality_policy: str = "standard",
 ) -> Any:
-    """Fit each chain/site independently, then summarize times across chains.
+    """Fit per-chain/site decays and summarize their amplitude-normalized areas.
 
-    A single ReconfigurationCorrelationResult returns a ReconfigurationTimeResult;
-    a mapping returns the same mapping of fitted results. No correlations are
-    pooled between chains before fitting. ACF construction must be repeated to
-    change chain/residue/time selection; fitting alone can be rerun for new
-    lag windows or models without rereading trajectories.
+    Default model='auto' compares single, stretched, and double exponentials.
+    It keeps the simpler model unless the more complex model reduces the
+    descriptive robust residual score by >20% AND >0.005 correlation units.
+    This is an explicit heuristic, NOT an AIC/p-value test on independent lags.
+    All candidates use the same window, observations, and weights.
 
-    Default: C_fit(t)=exp(-t/tau). With fit_amplitude=True use A exp(-t/tau).
-    model='double'/'biexponential' fits A*[f exp(-t/tau_fast)+(1-f) exp(-t/tau_slow)].
-    A is fixed at 1 unless requested. tau_ns then means f*tau_fast+(1-f)*tau_slow,
-    i.e. the area under the fitted decay divided by its fitted initial amplitude.
-    For a fit starting after a fast transient, this is a TAIL timescale, not the
-    area under the complete measured ACF. All models decay to zero; no adjustable
-    baseline is used to hide an unresolved slow component.
+    With fit_tmax=None and auto_window=True, stop after a sustained region at
+    C<=auto_cutoff (0.02), retaining the slow decay before it. Isolated crossings
+    and late substantial positive recovery are checked. If no tail is detected,
+    use all saved lags. The cutoff is operational, not an estimated noise level.
+    Explicit fit_tmax overrides automatic window selection. Set auto_window=False
+    to use the entire saved lag range. Smoothing is ONLY for window detection;
+    raw signed C values, including negatives, are used for all fits.
 
-    Numeric fit limits are PHYSICAL lag times in ns, inclusive, after any
-    kinetic_scale used during calculation. Default tmax is the last saved lag.
-    Least squares uses equal weights in C-space, retaining negative observations.
-    Lag points are correlated, so fit covariance is not used for error bars.
+    soft_l1 (f_scale=0.05 correlation units) reduces outlier influence.
+    lag_weighting='balanced' averages linear-time and log(1+t/t_first)-time
+    quadrature weights, so early decay and slow tail both influence fitting.
+    'uniform' gives equal weights to saved lag samples. These weights do NOT
+    estimate independent observations or their statistical uncertainties.
+    At most max_fit_points raw lag samples are used by each multistart optimizer;
+    residual/model comparisons are evaluated on every finite lag in the window.
 
-    Quality gates are heuristics, NOT a proof of kinetic convergence:
-    - >=8 fitted points and R-squared >=0.8;
-    - fastest fitted time >= one input-sample interval;
-    - fitting span >=2 times the slowest fitted time;
-    - longest continuous observation >=10 times the slowest fitted time;
-    - no optimizer-bound, ill-conditioning, or unresolved biexponential components.
-    Numerical estimates and flags are always retained in .fits. Flagged estimates
-    do not enter means unless include_flagged=True. Change thresholds explicitly
-    to relax a gate; inspect curves, support, and stationarity before doing so.
+    single: C=A*exp(-t/tau). double: C=A*[f exp(-t/tau_fast)
+    +(1-f) exp(-t/tau_slow)]. stretched: C=A*exp(-(t/tau_scale)**beta),
+    0.2<=beta<=1. A is fixed at 1 unless fit_amplitude=True. tau_ns is always
+    the INTEGRAL of C_fit/A over 0..infinity: tau, f*tau_fast+(1-f)*tau_slow,
+    or tau_scale*Gamma(1+1/beta), respectively. A tail-only fit is not the full
+    ACF integral. No additive offset is fitted.
 
-    For torsions, residue_averaging='common' uses residues with accepted fits in
-    EVERY selected chain for the one-number summary. 'available' uses each
-    chain's accepted residues, which can compare different residue sets and bias
-    the summary if missing/unresolved sites are systematically slower. The
-    residue profile always reports available-chain means, SD, SEM and counts.
-    Do not treat excluded slow/constant sites as fast: inspect coverage and flags.
-    Rg simply averages accepted per-chain fits. All SEMs are NaN for <2 chains.
+    check_stability refits the chosen model with endpoints at 0.8 and 1.2 times
+    the selected fitting span (limited by available lags). window_sensitivity
+    is the largest relative change in tau_ns, NOT a statistical error bar.
+    tail_fraction is the fraction of fitted area extrapolated beyond the window.
+    Both refer to the chosen model; inspect alternative models as well.
+
+    quality_policy='standard': reject numerical/model failures, large residuals,
+    unresolved sampling intervals/components, substantial negative lobes, >20%
+    extrapolated area, or >35% window sensitivity. The older R-squared,
+    span>=2*slow_tau and observation>=10*slow_tau checks are ADVISORY flags,
+    not automatic vetoes. max_fit_rmse applies to the robust selection score;
+    weighted_rmse and the ordinary R-squared remain available as diagnostics.
+    'strict' rejects any flagged fit. include_flagged=True overrides rejection
+    only for successful finite fits; flags and rejection_flags remain visible.
+    Accepted means numerically usable under these heuristics, not converged.
+
+    Numeric fit limits are physical lag times in ns, inclusive, AFTER kinetic
+    scaling. ACF construction and original chain/residue selection are unchanged.
+    Mapping inputs preserve their keys. Each chain/site is fitted separately,
+    then site times are averaged within chains and chain means averaged equally.
+    residue_averaging='common' requires accepted sites in EVERY selected chain;
+    'available' can mix residue coverage and must be used with caution. All
+    across-chain SD/SEM values remain NaN for fewer than two contributing chains.
     """
     if isinstance(correlations, Mapping):
         if not correlations:
@@ -989,6 +1301,19 @@ def fit_reconfiguration_times(
                 include_flagged=include_flagged,
                 residue_averaging=residue_averaging,
                 warn=warn,
+                auto_window=auto_window,
+                auto_cutoff=auto_cutoff,
+                loss=loss,
+                f_scale=f_scale,
+                lag_weighting=lag_weighting,
+                max_fit_points=max_fit_points,
+                check_stability=check_stability,
+                max_window_sensitivity=max_window_sensitivity,
+                max_tail_fraction=max_tail_fraction,
+                model_improvement=model_improvement,
+                min_model_improvement=min_model_improvement,
+                max_fit_rmse=max_fit_rmse,
+                quality_policy=quality_policy,
             )
             for key, value in correlations.items()
         }
@@ -1001,9 +1326,12 @@ def fit_reconfiguration_times(
         "double": "double",
         "biexponential": "double",
         "bi": "double",
+        "auto": "auto",
+        "stretched": "stretched",
+        "kww": "stretched",
     }
     if model not in aliases:
-        raise ValueError("model must be 'single' or 'double'/'biexponential'")
+        raise ValueError("model must be 'auto', 'single', 'double', or 'stretched'")
     model = aliases[model]
     if residue_averaging not in {"common", "available"}:
         raise ValueError("residue_averaging must be 'common' or 'available'")
@@ -1011,6 +1339,8 @@ def fit_reconfiguration_times(
         ("fit_amplitude", fit_amplitude),
         ("include_flagged", include_flagged),
         ("warn", warn),
+        ("auto_window", auto_window),
+        ("check_stability", check_stability),
     ):
         if not isinstance(value, (bool, np.bool_)):
             raise TypeError(f"{name} must be a boolean")
@@ -1023,6 +1353,29 @@ def fit_reconfiguration_times(
     ):
         if not np.isfinite(value) or value < 0:
             raise ValueError(f"{name} must be finite and nonnegative")
+    if loss not in {"linear", "soft_l1"}:
+        raise ValueError("loss must be 'linear' or 'soft_l1'")
+    if lag_weighting not in {"uniform", "balanced"}:
+        raise ValueError("lag_weighting must be 'uniform' or 'balanced'")
+    if quality_policy not in {"standard", "strict"}:
+        raise ValueError("quality_policy must be 'standard' or 'strict'")
+    for name, value in (("f_scale", f_scale), ("max_fit_rmse", max_fit_rmse)):
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be finite and positive")
+    for name, value in (
+        ("auto_cutoff", auto_cutoff),
+        ("max_tail_fraction", max_tail_fraction),
+        ("model_improvement", model_improvement),
+    ):
+        if not np.isfinite(value) or not 0 < value < 1:
+            raise ValueError(f"{name} must be between 0 and 1")
+    for name, value in (
+        ("max_window_sensitivity", max_window_sensitivity),
+        ("min_model_improvement", min_model_improvement),
+    ):
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and nonnegative")
+    max_fit_points = _integer(max_fit_points, "max_fit_points", max(8, min_fit_points))
     time = np.asarray(correlations.lag_time_ns, dtype=float)
     data = np.asarray(correlations.correlation)
     if (
@@ -1055,7 +1408,7 @@ def fit_reconfiguration_times(
                 duration = correlations.max_contiguous_time_ns
                 if correlations.contiguous_time_per_site_ns is not None:
                     duration = float(correlations.contiguous_time_per_site_ns[ci, ri])
-                fitted = _fit_one(
+                fitted = _fit_one_automatic(
                     time,
                     curve,
                     model=model,
@@ -1069,6 +1422,19 @@ def fit_reconfiguration_times(
                     min_decay_times=min_decay_times,
                     min_observation_times=min_observation_times,
                     include_flagged=include_flagged,
+                    automatic_window=bool(auto_window and fit_tmax is None),
+                    auto_cutoff=auto_cutoff,
+                    loss=loss,
+                    f_scale=f_scale,
+                    lag_weighting=lag_weighting,
+                    max_fit_points=max_fit_points,
+                    check_stability=check_stability,
+                    max_window_sensitivity=max_window_sensitivity,
+                    max_tail_fraction=max_tail_fraction,
+                    model_improvement=model_improvement,
+                    min_model_improvement=min_model_improvement,
+                    max_fit_rmse=max_fit_rmse,
+                    quality_policy=quality_policy,
                 )
             chain_fits.append(fitted)
             if fitted.accepted:
@@ -1092,12 +1458,38 @@ def fit_reconfiguration_times(
     n_accepted = int(accepted.sum())
     label = correlations.dataset_label
     if warn and n_accepted < n_fitted:
+        reasons = sorted(
+            {
+                reason
+                for entries in fits.values()
+                for item in entries
+                if not item.accepted
+                for reason in (item.rejection_flags or item.flags)
+            }
+        )
         warnings.warn(
             f"{label}: accepted {n_accepted}/{n_fitted} fluctuating chain/site fits. "
-            "Summary is conditional on accepted fits; inspect .fits[chain][site].flags.",
+            f"Reasons: {', '.join(reasons)}. Inspect .fits[chain][site].flags.",
             RuntimeWarning,
             stacklevel=2,
         )
+    if warn:
+        cautions = sorted(
+            {
+                reason
+                for entries in fits.values()
+                for item in entries
+                if item.accepted
+                for reason in item.flags
+            }
+        )
+        if cautions:
+            warnings.warn(
+                f"{label}: accepted fits carry cautions: {', '.join(cautions)}. "
+                "Accepted is not a convergence guarantee; inspect fit diagnostics.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
     if warn and not int(n_chains):
         warnings.warn(
             f"{label}: no comparable accepted sites remain for the summary; mean_tau_ns is NaN. "
@@ -1170,6 +1562,7 @@ def plot_reconfiguration_correlations(
     correlations: Any,
     *,
     fits: Any = None,
+    include_flagged_fits: bool = False,
     resnum: Optional[int] = None,
     show_chains: bool = False,
     uncertainty: Optional[str] = "sem",
@@ -1195,7 +1588,12 @@ def plot_reconfiguration_correlations(
     windows; it is NOT exp(-t/mean_tau). It uses the same accepted sites as the
     solid curve whenever fits are supplied, avoiding a coverage mismatch.
     Residue-profile selection is made at correlation calculation time.
+    If no selected fit is accepted, show the raw curve rather than a blank plot.
+    include_flagged_fits=True overlays all numerically successful fits for
+    diagnosis without changing the accepted time-scale summary.
     """
+    if not isinstance(include_flagged_fits, (bool, np.bool_)):
+        raise TypeError("include_flagged_fits must be a boolean")
     if uncertainty not in {None, "sem", "std"}:
         raise ValueError("uncertainty must be sem, std, or None")
     factor, unit = _plot_scale(time_unit)
@@ -1240,9 +1638,31 @@ def plot_reconfiguration_correlations(
             ):
                 raise ValueError(f"{key}: fits and correlations have different source time windows")
             mask = fit.accepted.copy()
-            if site is None and fit.kind == "torsions" and fit.residue_averaging == "common":
+            if include_flagged_fits:
+                mask = np.asarray(
+                    [
+                        [item.optimizer_success for item in fit.fits[chain]]
+                        for chain in raw.chain_labels
+                    ],
+                    dtype=bool,
+                )
+            if (
+                not include_flagged_fits
+                and site is None
+                and fit.kind == "torsions"
+                and fit.residue_averaging == "common"
+            ):
                 mask &= np.isin(raw.residue_numbers, fit.summary_residue_numbers)[None, :]
-            grid = np.where(mask[:, :, None], grid, np.nan)
+            has_selected_fit = np.any(mask) if site is None else np.any(mask[:, site])
+            if has_selected_fit:
+                grid = np.where(mask[:, :, None], grid, np.nan)
+            else:
+                warnings.warn(
+                    f"{key}: no accepted fits; showing the original correlation without "
+                    "a fitted overlay. Set include_flagged_fits=True for diagnostics.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             predictions = np.full_like(grid, np.nan)
             for ci, chain in enumerate(raw.chain_labels):
                 for ri, item in enumerate(fit.fits[chain]):
@@ -1285,13 +1705,23 @@ def plot_reconfiguration_correlations(
             keep = np.isfinite(prediction_mean) & ((x > 0) if xscale == "log" else True)
             if yscale == "log":
                 keep &= prediction_mean > 0
-            ax.plot(
-                x[keep],
-                prediction_mean[keep],
-                linestyle="--",
-                color=color,
-                label=f"{label}: mean individual fits",
-            )
+            if np.any(keep):
+                used = [
+                    item
+                    for chain in raw.chain_labels
+                    for ri, item in enumerate(fit.fits[chain])
+                    if (site is None or ri == site)
+                    and (item.accepted or (include_flagged_fits and item.optimizer_success))
+                ]
+                models = "/".join(sorted({item.model for item in used}))
+                suffix = " (includes flagged)" if any(not item.accepted for item in used) else ""
+                ax.plot(
+                    x[keep],
+                    prediction_mean[keep],
+                    linestyle="--",
+                    color=color,
+                    label=f"{label}: {models} fit{suffix}",
+                )
     if not plotted:
         raise ValueError(
             "no finite curves to plot (or no accepted fits); omit fits to inspect all ACFs"
