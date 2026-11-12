@@ -126,6 +126,16 @@ from scipy.linalg import eigh_tridiagonal
 from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import curve_fit
 
+from .reconfiguration import (
+    ReconfigurationCorrelationResult,
+    ReconfigurationDecayFit,
+    ReconfigurationTimeResult,
+    calculate_reconfiguration_correlations,
+    fit_reconfiguration_times,
+    plot_reconfiguration_correlations,
+    plot_reconfiguration_times,
+)
+
 PathLike = Union[str, Path]
 
 # Custom colormap: turbo compressed into the first 10% of the range,
@@ -377,6 +387,14 @@ def fit_dist_msd_linear_bins(
 
 
 __all__ = [
+    # Dynamic reconfiguration analysis
+    "ReconfigurationCorrelationResult",
+    "ReconfigurationDecayFit",
+    "ReconfigurationTimeResult",
+    "calculate_reconfiguration_correlations",
+    "fit_reconfiguration_times",
+    "plot_reconfiguration_correlations",
+    "plot_reconfiguration_times",
     # Local helpers
     "AverageResult",
     "OnOffRatesResult",
