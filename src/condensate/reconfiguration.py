@@ -1764,6 +1764,8 @@ def plot_reconfiguration_correlations(
     xlim: Optional[tuple[float, float]] = None,
     ylim: Optional[tuple[float, float]] = None,
     labels: Optional[Mapping[str, str]] = None,
+    xlabel: Optional[str] = None,
+    ylabel: Optional[str] = None,
     title: Optional[str] = None,
     figsize: tuple[float, float] = (6.0, 4.0),
     ax: Any = None,
@@ -1785,6 +1787,7 @@ def plot_reconfiguration_correlations(
     diagnosis without changing the accepted time-scale summary.
     show_fit_parameters=True includes component parameters in the legend when
     exactly one fitted chain/site contributes to a plotted curve.
+    xlabel/ylabel optionally override the default axis labels.
     """
     if not isinstance(include_flagged_fits, (bool, np.bool_)):
         raise TypeError("include_flagged_fits must be a boolean")
@@ -1939,8 +1942,8 @@ def plot_reconfiguration_correlations(
             "no finite curves to plot (or no accepted fits); omit fits to inspect all ACFs"
         )
     ax.set(
-        xlabel=f"lag time ({unit})",
-        ylabel="connected autocorrelation",
+        xlabel=f"lag time ({unit})" if xlabel is None else xlabel,
+        ylabel="connected autocorrelation" if ylabel is None else ylabel,
         xscale=xscale,
         yscale=yscale,
     )
@@ -1967,6 +1970,8 @@ def plot_reconfiguration_times(
     xlim: Optional[tuple[float, float]] = None,
     ylim: Optional[tuple[float, float]] = None,
     labels: Optional[Mapping[str, str]] = None,
+    xlabel: Optional[str] = None,
+    ylabel: Optional[str] = None,
     title: Optional[str] = None,
     figsize: tuple[float, float] = (8.0, 4.0),
     ax: Any = None,
@@ -1980,6 +1985,7 @@ def plot_reconfiguration_times(
     remain gaps. min_chains can require a fixed minimum coverage per residue;
     inspect residue_n_chains when comparing profiles. For one chain the point
     is plotted with no error bar, because chain variation is not estimable.
+    xlabel/ylabel optionally override the default axis labels.
     """
     if uncertainty not in {None, "sem", "std"}:
         raise ValueError("uncertainty must be sem, std, or None")
@@ -2027,7 +2033,11 @@ def plot_reconfiguration_times(
                 ax.plot(x, row * factor, alpha=0.25, linewidth=0.6, color=color)
     if not plotted:
         raise ValueError("no accepted residue fits meet min_chains; inspect fit flags")
-    ax.set(xlabel="PDB residue number", ylabel=f"reconfiguration time ({unit})", yscale=yscale)
+    ax.set(
+        xlabel="PDB residue number" if xlabel is None else xlabel,
+        ylabel=f"reconfiguration time ({unit})" if ylabel is None else ylabel,
+        yscale=yscale,
+    )
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     if title is not None:
         ax.set_title(title)
