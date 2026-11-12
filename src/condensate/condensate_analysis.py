@@ -392,6 +392,9 @@ __all__ = [
     "QuenchingFitResult",
     "apply_decay",
     "HistogramResult",
+    "Histogram2DResult",
+    "calculate_2d_histogram",
+    "plot_2d_histogram",
     "RadialNumberDensityResult",
     "ResidueDensityProfileResult",
     "ResidueDensityMapResult",
@@ -4754,6 +4757,680 @@ def plot_timeseries(
     )
 
     return ax
+
+
+# --- general two-variable / Ramachandran histograms ---------------------------
+
+
+@dataclass(frozen=True)
+class Histogram2DResult:
+    """Average 2D histogram, with plotting convention values[y_bin, x_bin].
+
+    Default equal weighting gives each selected chain/residue time series one
+    normalized histogram, averages these within each dataset, and (if several
+    datasets are supplied) averages the dataset histograms equally.  This does
+    not weight long or numerous chains more heavily than short/fewer chains.
+    """
+
+    values: np.ndarray
+    x_edges: np.ndarray
+    y_edges: np.ndarray
+    x_field: str
+    y_field: str
+    normalization: str
+    aggregation: str
+    n_series: int
+    n_observations: int
+    n_datasets: int
+    angle_units: str
+
+    @property
+    def x_centers(self) -> np.ndarray:
+        return 0.5 * (self.x_edges[:-1] + self.x_edges[1:])
+
+    @property
+    def y_centers(self) -> np.ndarray:
+        return 0.5 * (self.y_edges[:-1] + self.y_edges[1:])
+
+
+def _hist2d_residue_mask(
+    residue_numbers: np.ndarray,
+    *,
+    resnum: Optional[int],
+    residue_range: Optional[tuple[int, int]],
+    residues: Optional[Sequence[int]],
+) -> np.ndarray:
+    """Select PDB residue numbers, with inclusive range endpoints."""
+    options = sum(value is not None for value in (resnum, residue_range, residues))
+    if options > 1:
+        raise ValueError("resnum, residue_range, and residues are mutually exclusive")
+    numbers = np.asarray(residue_numbers)
+    if numbers.ndim != 1:
+        raise ValueError("residue_numbers must be a one-dimensional array")
+    if resnum is not None:
+        return numbers == int(resnum)
+    if residue_range is not None:
+        if len(residue_range) != 2:
+            raise ValueError("residue_range must be an inclusive (first, last) pair")
+        first, last = (int(value) for value in residue_range)
+        if last < first:
+            raise ValueError("residue_range must have first <= last")
+        return (numbers >= first) & (numbers <= last)
+    if residues is not None:
+        if isinstance(residues, (str, bytes)):
+            raise TypeError("residues must be a sequence of PDB residue numbers")
+        wanted = [int(value) for value in residues]
+        if not wanted:
+            raise ValueError("residues must not be empty")
+        return np.isin(numbers, wanted)
+    return np.ones(numbers.size, dtype=bool)
+
+
+def _hist2d_sources(data: Any, x_field: str, y_field: str) -> list[tuple[str, Any]]:
+    """Flatten result mappings while distinguishing mappings of numeric fields."""
+    if hasattr(data, "chains") and hasattr(data, "unit"):
+        return [("data", data)]
+    if isinstance(data, (tuple, list)) and len(data) == 2:
+        return [("data", {x_field: data[0], y_field: data[1]})]
+    if isinstance(data, Mapping):
+        if x_field in data and y_field in data:
+            return [("data", data)]
+        if not data:
+            raise ValueError("data mapping is empty")
+        leaves: list[tuple[str, Any]] = []
+        for key, item in data.items():
+            for name, value in _hist2d_sources(item, x_field, y_field):
+                leaves.append((str(key) if name == "data" else f"{key}/{name}", value))
+        return leaves
+    # One result with two named arrays; also supports object properties.
+    if hasattr(data, x_field) and hasattr(data, y_field):
+        return [("data", data)]
+    raise TypeError(
+        "data must be a torsion result, an object/mapping with x_field and "
+        "y_field arrays, or a mapping of such results"
+    )
+
+
+def _hist2d_chain_selection(
+    labels: Sequence[str],
+    *,
+    chain_indices: Optional[Sequence[int]],
+    include_chains: Optional[Sequence[str]],
+    exclude_chains: Optional[Sequence[str]],
+    strict_chain_selection: bool,
+    labeled: bool,
+) -> np.ndarray:
+    if include_chains is not None and exclude_chains is not None:
+        raise ValueError("include_chains and exclude_chains are mutually exclusive")
+    n_chains = len(labels)
+    if chain_indices is None:
+        indices = np.arange(n_chains, dtype=np.int64)
+    else:
+        indices = np.asarray(chain_indices, dtype=np.int64)
+        if indices.ndim != 1 or indices.size == 0:
+            raise ValueError("chain_indices must be a nonempty one-dimensional sequence")
+        if np.any(indices < 0) or np.any(indices >= n_chains):
+            raise ValueError("chain_indices contains an out-of-range index")
+        if len(set(indices.tolist())) != indices.size:
+            raise ValueError("chain_indices contains duplicate indices")
+
+    selection = include_chains if include_chains is not None else exclude_chains
+    if selection is not None:
+        if not labeled:
+            raise ValueError("named chain selection requires chain_labels in the result")
+        if isinstance(selection, (str, bytes)) or not isinstance(selection, Sequence):
+            raise TypeError("include_chains/exclude_chains must be sequences of segment IDs")
+        wanted = tuple(str(label) for label in selection)
+        if len(set(wanted)) != len(wanted):
+            raise ValueError("named chain selection contains duplicate segment IDs")
+        unknown = sorted(set(wanted) - set(labels))
+        if unknown and strict_chain_selection:
+            raise ValueError(f"unknown chain IDs {unknown}; available: {list(labels)}")
+        matched = set(wanted)
+        if include_chains is not None:
+            indices = np.asarray([i for i in indices if labels[int(i)] in matched], dtype=np.int64)
+        else:
+            indices = np.asarray(
+                [i for i in indices if labels[int(i)] not in matched], dtype=np.int64
+            )
+    return indices
+
+
+def _hist2d_series_for_source(
+    result: Any,
+    x_field: str,
+    y_field: str,
+    *,
+    resnum: Optional[int],
+    residue_range: Optional[tuple[int, int]],
+    residues: Optional[Sequence[int]],
+    chain_indices: Optional[Sequence[int]],
+    include_chains: Optional[Sequence[str]],
+    exclude_chains: Optional[Sequence[str]],
+    strict_chain_selection: bool,
+    mintime: Any,
+    maxtime: Any,
+    delta_t: Any,
+    angle_units: str,
+) -> tuple[list[tuple[np.ndarray, np.ndarray]], str, float]:
+    """Return aligned 1D views, one per selected chain/residue."""
+    if hasattr(result, "chains") and hasattr(result, "unit"):
+        if x_field not in {"phi", "psi", "omega", "chi1", "chi2"} or y_field not in {
+            "phi",
+            "psi",
+            "omega",
+            "chi1",
+            "chi2",
+        }:
+            raise ValueError("torsion results require phi, psi, omega, chi1, or chi2 fields")
+        source_unit = str(result.unit).lower()
+        if source_unit not in {"radians", "degrees"}:
+            raise ValueError(f"unknown torsion unit {result.unit!r}")
+        target_unit = source_unit if angle_units == "native" else angle_units
+        factor = (
+            1.0
+            if source_unit == target_unit
+            else (180.0 / np.pi if target_unit == "degrees" else np.pi / 180.0)
+        )
+        pairs: list[tuple[np.ndarray, np.ndarray]] = []
+        # First remove chains with no requested residue, matching the behavior
+        # of plot_timeseries(resnum=...).
+        candidates: list[tuple[str, Any, np.ndarray]] = []
+        for label, chain in result.chains.items():
+            numbers = np.asarray(chain.residue_numbers)
+            mask = _hist2d_residue_mask(
+                numbers, resnum=resnum, residue_range=residue_range, residues=residues
+            )
+            if np.any(mask):
+                candidates.append((str(label), chain, mask))
+        labels = tuple(item[0] for item in candidates)
+        indices = _hist2d_chain_selection(
+            labels,
+            chain_indices=chain_indices,
+            include_chains=include_chains,
+            exclude_chains=exclude_chains,
+            strict_chain_selection=strict_chain_selection,
+            labeled=True,
+        )
+        first, stop = _resolve_frame_slice(
+            int(result.n_frames), time_start=mintime, time_stop=maxtime, delta_t=delta_t
+        )
+        for i in indices:
+            label, chain, mask = candidates[int(i)]
+            xx = np.asarray(getattr(chain, x_field))
+            yy = np.asarray(getattr(chain, y_field))
+            expected = (len(chain.residue_numbers), int(result.n_frames))
+            if xx.shape != expected or yy.shape != expected:
+                raise ValueError(f"{label!r}: torsion array must have shape {expected}")
+            for res_i in np.flatnonzero(mask):
+                # Conversion is done per series later, avoiding an extra copy of
+                # the full (residues, frames) trajectory.
+                pairs.append((xx[int(res_i), first:stop], yy[int(res_i), first:stop]))
+        return pairs, target_unit, factor
+
+    xx = np.asarray(_result_field(result, x_field))
+    yy = np.asarray(_result_field(result, y_field))
+    if xx.shape != yy.shape or xx.ndim not in {1, 2, 3}:
+        raise ValueError("x/y arrays must have the same 1D, 2D, or 3D shape")
+    if xx.ndim == 1:
+        xx, yy = xx[None, :], yy[None, :]
+    n_frames = xx.shape[-1]
+    if xx.ndim == 3:
+        numbers = np.asarray(_result_field(result, "residue_numbers"))
+        if numbers.shape != (xx.shape[1],):
+            raise ValueError("3D fields require residue_numbers matching the residue axis")
+        res_mask = _hist2d_residue_mask(
+            numbers, resnum=resnum, residue_range=residue_range, residues=residues
+        )
+    else:
+        if any(value is not None for value in (resnum, residue_range, residues)):
+            raise ValueError(
+                "residue selection requires torsion data or 3D residue-resolved fields"
+            )
+        res_mask = np.ones(1, dtype=bool)
+
+    labels_value = (
+        _result_field(result, "chain_labels") if _result_has_field(result, "chain_labels") else None
+    )
+    labeled = labels_value is not None
+    labels = (
+        tuple(str(item) for item in labels_value)
+        if labeled
+        else tuple(f"chain {i}" for i in range(xx.shape[0]))
+    )
+    if len(labels) != xx.shape[0] or len(set(labels)) != len(labels):
+        raise ValueError("chain_labels must contain one unique label per chain")
+    indices = _hist2d_chain_selection(
+        labels,
+        chain_indices=chain_indices,
+        include_chains=include_chains,
+        exclude_chains=exclude_chains,
+        strict_chain_selection=strict_chain_selection,
+        labeled=labeled,
+    )
+    first, stop = _resolve_frame_slice(
+        n_frames, time_start=mintime, time_stop=maxtime, delta_t=delta_t
+    )
+    if xx.ndim == 2:
+        pairs = [(xx[int(i), first:stop], yy[int(i), first:stop]) for i in indices]
+    else:
+        pairs = [
+            (xx[int(i), int(j), first:stop], yy[int(i), int(j), first:stop])
+            for i in indices
+            for j in np.flatnonzero(res_mask)
+        ]
+    return pairs, "native", 1.0
+
+
+def _hist2d_edges(
+    bins: Union[int, Sequence[float], np.ndarray],
+    value_range: Optional[tuple[float, float]],
+    values_min: float,
+    values_max: float,
+    *,
+    name: str,
+) -> np.ndarray:
+    if np.isscalar(bins):
+        if isinstance(bins, (bool, np.bool_)) or not float(bins).is_integer() or int(bins) < 1:
+            raise ValueError(f"{name}bins must be a positive integer or an array of bin edges")
+        if value_range is None:
+            if not np.isfinite(values_min) or not np.isfinite(values_max):
+                raise ValueError(f"cannot infer {name}_range from data with no finite values")
+            padding = 0.01 * max(values_max - values_min, abs(values_min), 1.0)
+            lo, hi = values_min - padding, values_max + padding
+        else:
+            if len(value_range) != 2:
+                raise ValueError(f"{name}_range must contain (min, max)")
+            lo, hi = map(float, value_range)
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            raise ValueError(f"{name}_range must be finite and increasing")
+        return np.linspace(lo, hi, int(bins) + 1)
+    edges = np.asarray(bins, dtype=np.float64)
+    if edges.ndim != 1 or edges.size < 2 or not np.all(np.isfinite(edges)):
+        raise ValueError(f"{name}bins edges must be a finite one-dimensional array")
+    if not np.all(np.diff(edges) > 0):
+        raise ValueError(f"{name}bins edges must increase strictly")
+    if value_range is not None:
+        raise ValueError(f"specify either {name}bins edges or {name}_range, not both")
+    return edges.copy()
+
+
+def calculate_2d_histogram(
+    data: Any,
+    x_field: str = "phi",
+    y_field: str = "psi",
+    delta_t: Any = None,
+    *,
+    mintime: Any = None,
+    maxtime: Any = None,
+    x_range: Optional[tuple[float, float]] = None,
+    y_range: Optional[tuple[float, float]] = None,
+    xbins: Union[int, Sequence[float], np.ndarray] = 72,
+    ybins: Union[int, Sequence[float], np.ndarray] = 72,
+    resnum: Optional[int] = None,
+    residue_range: Optional[tuple[int, int]] = None,
+    residues: Optional[Sequence[int]] = None,
+    chain_indices: Optional[Sequence[int]] = None,
+    include_chains: Optional[Sequence[str]] = None,
+    exclude_chains: Optional[Sequence[str]] = None,
+    strict_chain_selection: bool = True,
+    angle_units: str = "degrees",
+    normalization: str = "density",
+    aggregation: str = "equal",
+) -> Histogram2DResult:
+    """Average paired x/y histograms from torsion or general trajectory data.
+
+    Torsions: one sample series per selected (physical chain, PDB residue).
+    Arbitrary data: fields on an object/mapping with matching 1D (frames),
+    2D (chains, frames), or 3D (chains, residues, frames) arrays. A mapping
+    of dataset results is also accepted. Generic 3D data need residue_numbers.
+
+    ``mintime``/``maxtime`` (ns or OpenMM quantities) select [min, max);
+    delta_t is the physical spacing of ALREADY ANALYZED input frames (ns).
+    ``residue_range=(first, last)`` has inclusive endpoints. If neither it
+    nor ``resnum`` nor ``residues`` is given, all residues are considered.
+
+    ``angle_units`` only affects torsion results: 'degrees' (default),
+    'radians', or 'native'. It never alters cached input arrays. For angular
+    torsions, full x/y ranges default to [-180,180] or [-pi,pi].
+
+    ``normalization='density'`` is conditional probability density per unit
+    x per unit y (integrates to 1). 'probability' gives bin probability.
+    'counts' gives mean observations per bin per contributing series.
+    For equal aggregation, each (chain, residue) histogram is normalized
+    separately using its observations inside the plotted ranges. Those
+    histograms are averaged equally within each dataset and then across
+    datasets. 'pooled' weights all frames/series equally by observations.
+    """
+    if not isinstance(strict_chain_selection, (bool, np.bool_)):
+        raise TypeError("strict_chain_selection must be bool")
+    if not isinstance(x_field, str) or not x_field or not isinstance(y_field, str) or not y_field:
+        raise ValueError("x_field and y_field must be nonempty strings")
+    if any(value is not None for value in (mintime, maxtime)) and delta_t is None:
+        raise ValueError("delta_t is required with mintime or maxtime")
+    angle_name = str(angle_units).strip().lower()
+    if angle_name not in {"degrees", "radians", "native"}:
+        raise ValueError("angle_units must be 'degrees', 'radians', or 'native'")
+    norm = str(normalization).strip().lower()
+    if norm not in {"density", "probability", "counts"}:
+        raise ValueError("normalization must be 'density', 'probability', or 'counts'")
+    agg = str(aggregation).strip().lower()
+    if agg not in {"equal", "pooled"}:
+        raise ValueError("aggregation must be 'equal' or 'pooled'")
+    if sum(v is not None for v in (resnum, residue_range, residues)) > 1:
+        raise ValueError("resnum, residue_range, and residues are mutually exclusive")
+    if isinstance(resnum, (bool, np.bool_)):
+        raise TypeError("resnum must be an integer PDB residue number")
+
+    datasets = _hist2d_sources(data, x_field, y_field)
+    series_by_dataset: list[tuple[list[tuple[np.ndarray, np.ndarray]], float]] = []
+    x_min = y_min = np.inf
+    x_max = y_max = -np.inf
+    detected_units: set[str] = set()
+    for _, source in datasets:
+        pairs, unit, factor = _hist2d_series_for_source(
+            source,
+            x_field,
+            y_field,
+            resnum=resnum,
+            residue_range=residue_range,
+            residues=residues,
+            chain_indices=chain_indices,
+            include_chains=include_chains,
+            exclude_chains=exclude_chains,
+            strict_chain_selection=strict_chain_selection,
+            mintime=mintime,
+            maxtime=maxtime,
+            delta_t=delta_t,
+            angle_units=angle_name,
+        )
+        if not pairs:
+            continue
+        detected_units.add(unit)
+        series_by_dataset.append((pairs, factor))
+        for xx, yy in pairs:
+            valid = np.isfinite(xx) & np.isfinite(yy)
+            if np.any(valid):
+                x_min = min(x_min, float(np.min(xx[valid])) * factor)
+                x_max = max(x_max, float(np.max(xx[valid])) * factor)
+                y_min = min(y_min, float(np.min(yy[valid])) * factor)
+                y_max = max(y_max, float(np.max(yy[valid])) * factor)
+    if not np.isfinite(x_min) or not np.isfinite(y_min):
+        raise ValueError("no finite paired x/y observations remain after selection")
+    if len(detected_units) > 1:
+        raise ValueError("cannot combine results with mixed native and angular units")
+    result_unit = next(iter(detected_units))
+    if result_unit != "native":
+        default_range = (-180.0, 180.0) if result_unit == "degrees" else (-np.pi, np.pi)
+        if x_range is None and np.isscalar(xbins):
+            x_range = default_range
+        if y_range is None and np.isscalar(ybins):
+            y_range = default_range
+    x_edges = _hist2d_edges(xbins, x_range, x_min, x_max, name="x")
+    y_edges = _hist2d_edges(ybins, y_range, y_min, y_max, name="y")
+    shape = (len(y_edges) - 1, len(x_edges) - 1)
+    bin_areas = np.diff(y_edges)[:, None] * np.diff(x_edges)[None, :]
+
+    final_sum = np.zeros(shape, dtype=np.float64)
+    final_weight = 0
+    n_observations = 0
+    n_series = 0
+    n_datasets = 0
+    for pairs, factor in series_by_dataset:
+        one_set_sum = np.zeros(shape, dtype=np.float64)
+        contributing = 0
+        for xx, yy in pairs:
+            valid = np.isfinite(xx) & np.isfinite(yy)
+            if not np.any(valid):
+                continue
+            hist, _, _ = np.histogram2d(
+                xx[valid] * factor, yy[valid] * factor, bins=(x_edges, y_edges)
+            )
+            hist = hist.T
+            n_in_range = int(np.sum(hist))
+            if n_in_range == 0:
+                continue
+            if norm == "density":
+                hist /= n_in_range * bin_areas
+            elif norm == "probability":
+                hist /= n_in_range
+            n_observations += n_in_range
+            n_series += 1
+            contributing += 1
+            if agg == "pooled" and norm != "counts":
+                # Reverse normalization for observation-weighted aggregation.
+                one_set_sum += hist * n_in_range
+            else:
+                one_set_sum += hist
+        if contributing == 0:
+            continue
+        n_datasets += 1
+        if agg == "equal":
+            final_sum += one_set_sum / contributing
+            final_weight += 1
+        else:
+            final_sum += one_set_sum
+    if n_datasets == 0:
+        raise ValueError("no paired observations fall within the requested x/y ranges")
+    if agg == "equal":
+        hist_final = final_sum / final_weight
+    elif norm == "counts":
+        hist_final = final_sum / n_series  # mean counts/series
+    else:
+        hist_final = final_sum / n_observations
+
+    return Histogram2DResult(
+        values=hist_final,
+        x_edges=x_edges,
+        y_edges=y_edges,
+        x_field=x_field,
+        y_field=y_field,
+        normalization=norm,
+        aggregation=agg,
+        n_series=n_series,
+        n_observations=n_observations,
+        n_datasets=n_datasets,
+        angle_units=result_unit,
+    )
+
+
+def plot_2d_histogram(
+    data: Any,
+    x_field: str = "phi",
+    y_field: str = "psi",
+    delta_t: Any = None,
+    *,
+    mintime: Any = None,
+    maxtime: Any = None,
+    x_range: Optional[tuple[float, float]] = None,
+    y_range: Optional[tuple[float, float]] = None,
+    xbins: Union[int, Sequence[float], np.ndarray] = 72,
+    ybins: Union[int, Sequence[float], np.ndarray] = 72,
+    resnum: Optional[int] = None,
+    residue_range: Optional[tuple[int, int]] = None,
+    residues: Optional[Sequence[int]] = None,
+    chain_indices: Optional[Sequence[int]] = None,
+    include_chains: Optional[Sequence[str]] = None,
+    exclude_chains: Optional[Sequence[str]] = None,
+    strict_chain_selection: bool = True,
+    angle_units: str = "degrees",
+    normalization: str = "density",
+    aggregation: str = "equal",
+    style: str = "contourf",
+    levels: Union[int, Sequence[float], np.ndarray] = 20,
+    cmap: Any = "viridis",
+    color_scale: str = "linear",
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    colorbar: bool = True,
+    colorbar_label: Optional[str] = None,
+    colorbar_ticks: Optional[Sequence[float]] = None,
+    colorbar_kwargs: Optional[Mapping[str, Any]] = None,
+    xlabel: Optional[str] = None,
+    ylabel: Optional[str] = None,
+    title: Optional[str] = None,
+    figsize: tuple[float, float] = (6.0, 5.0),
+    ax: Optional[plt.Axes] = None,
+    save_path: Optional[PathLike] = None,
+    save_dpi: Optional[float] = None,
+    save_bbox_inches: Optional[str] = "tight",
+    save_kwargs: Optional[Mapping[str, Any]] = None,
+) -> tuple[plt.Figure, plt.Axes]:
+    """Plot a generic two-variable histogram, or a Ramachandran φ/ψ map.
+
+    All selection/averaging parameters match calculate_2d_histogram. ``style``
+    is 'contourf' (filled contours), 'contour' (lines), or 'pcolormesh'
+    (heatmap; 'surface' and 'heatmap' aliases accepted). ``color_scale`` is
+    'linear' or 'log'. For log scaling, empty bins are masked, not pseudocounted.
+    If data is a Histogram2DResult, its precomputed histogram is plotted directly.
+    """
+    from matplotlib.colors import LogNorm, Normalize
+
+    if isinstance(data, Histogram2DResult):
+        hist = data
+    else:
+        hist = calculate_2d_histogram(
+            data,
+            x_field=x_field,
+            y_field=y_field,
+            delta_t=delta_t,
+            mintime=mintime,
+            maxtime=maxtime,
+            x_range=x_range,
+            y_range=y_range,
+            xbins=xbins,
+            ybins=ybins,
+            resnum=resnum,
+            residue_range=residue_range,
+            residues=residues,
+            chain_indices=chain_indices,
+            include_chains=include_chains,
+            exclude_chains=exclude_chains,
+            strict_chain_selection=strict_chain_selection,
+            angle_units=angle_units,
+            normalization=normalization,
+            aggregation=aggregation,
+        )
+
+    style_name = str(style).strip().lower().replace("-", "_")
+    style_name = {"surface": "pcolormesh", "heatmap": "pcolormesh"}.get(style_name, style_name)
+    if style_name not in {"contourf", "contour", "pcolormesh"}:
+        raise ValueError("style must be 'contourf', 'contour', or 'pcolormesh'")
+    scale = str(color_scale).strip().lower()
+    if scale not in {"linear", "log"}:
+        raise ValueError("color_scale must be 'linear' or 'log'")
+
+    values = np.asarray(hist.values, dtype=np.float64)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        raise ValueError("histogram has no finite values")
+    if scale == "log":
+        positives = finite[finite > 0.0]
+        if positives.size == 0:
+            raise ValueError("log color scale requires at least one positive bin")
+        lo = float(np.min(positives)) if vmin is None else float(vmin)
+        hi = float(np.max(positives)) if vmax is None else float(vmax)
+        if hi <= lo and vmin is None and vmax is None:
+            hi = lo * (1.0 + 1.0e-8)
+        if lo <= 0.0 or hi <= lo:
+            raise ValueError("log scale requires 0 < vmin < vmax")
+        color_norm = LogNorm(vmin=lo, vmax=hi)
+        plotted = np.ma.masked_less_equal(np.ma.masked_invalid(values), 0.0)
+    else:
+        lo = float(np.min(finite)) if vmin is None else float(vmin)
+        hi = float(np.max(finite)) if vmax is None else float(vmax)
+        if hi <= lo and vmin is None and vmax is None:
+            hi = lo + max(1.0e-12, abs(lo) * 1.0e-8)
+        if hi <= lo:
+            raise ValueError("linear scale requires vmin < vmax")
+        color_norm = Normalize(vmin=lo, vmax=hi)
+        plotted = np.ma.masked_invalid(values)
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+    if style_name == "pcolormesh":
+        artist = ax.pcolormesh(
+            hist.x_edges,
+            hist.y_edges,
+            plotted,
+            cmap=cmap,
+            norm=color_norm,
+            shading="flat",
+        )
+    else:
+        if np.isscalar(levels):
+            if (
+                isinstance(levels, (bool, np.bool_))
+                or int(levels) != float(levels)
+                or int(levels) < 2
+            ):
+                raise ValueError("levels must be an integer >=2 or increasing contour levels")
+            boundaries = (
+                np.geomspace(lo, hi, int(levels))
+                if scale == "log"
+                else np.linspace(lo, hi, int(levels))
+            )
+        else:
+            boundaries = np.asarray(levels, dtype=np.float64)
+            if boundaries.ndim != 1 or boundaries.size < 2 or not np.all(np.isfinite(boundaries)):
+                raise ValueError("contour levels must be a finite 1D array of length >=2")
+            if np.any(np.diff(boundaries) <= 0.0):
+                raise ValueError("contour levels must increase strictly")
+            if scale == "log" and np.any(boundaries <= 0.0):
+                raise ValueError("log contour levels must be positive")
+        if values.shape[0] < 2 or values.shape[1] < 2:
+            raise ValueError("contours require at least two bins along both axes")
+        contours = ax.contourf if style_name == "contourf" else ax.contour
+        artist = contours(
+            hist.x_centers,
+            hist.y_centers,
+            plotted,
+            levels=boundaries,
+            cmap=cmap,
+            norm=color_norm,
+        )
+
+    if colorbar:
+        cb_kwargs = {} if colorbar_kwargs is None else dict(colorbar_kwargs)
+        if colorbar_ticks is not None:
+            cb_kwargs["ticks"] = colorbar_ticks
+        cb = fig.colorbar(artist, ax=ax, **cb_kwargs)
+        default_label = {
+            "density": "Probability density",
+            "probability": "Bin probability",
+            "counts": "Mean counts per series",
+        }[hist.normalization]
+        cb.set_label(default_label if colorbar_label is None else colorbar_label)
+
+    def axis_label(field: str) -> str:
+        if hist.angle_units in {"degrees", "radians"} and field in {
+            "phi",
+            "psi",
+            "omega",
+            "chi1",
+            "chi2",
+        }:
+            greek = {"phi": "φ", "psi": "ψ", "omega": "ω", "chi1": "χ₁", "chi2": "χ₂"}
+            unit = "°" if hist.angle_units == "degrees" else "rad"
+            return f"{greek[field]} ({unit})"
+        return field
+
+    ax.set_xlabel(xlabel if xlabel is not None else axis_label(hist.x_field))
+    ax.set_ylabel(ylabel if ylabel is not None else axis_label(hist.y_field))
+    if title is not None:
+        ax.set_title(title)
+    ax.set_xlim(hist.x_edges[0], hist.x_edges[-1])
+    ax.set_ylim(hist.y_edges[0], hist.y_edges[-1])
+    _save_figure_if_requested(
+        fig,
+        save_path,
+        save_dpi=save_dpi,
+        save_bbox_inches=save_bbox_inches,
+        save_kwargs=save_kwargs,
+    )
+    return fig, ax
 
 
 def plot_errorbar_datasets(
