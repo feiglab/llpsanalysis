@@ -7,6 +7,9 @@ Definitions
 -----------
 Scalar: C(t) = <delta x(s) delta x(s+t)> / <delta x**2>.
 Torsion: apply the same connected vector correlation to (cos(theta), sin(theta)).
+Segment shape: connected vector correlation of internal CA distances in a sliding
+window, centered separately by chain/window. The default normalizes the sum of
+distance covariances by the sum of their variances, not the ACF of a mean distance.
 Means are estimated separately for each chain/residue over the selected window.
 Combined torsions average their separately normalized correlations (equal weight
 by default). This is a local feature-memory measure, NOT a joint-state survival
@@ -145,6 +148,11 @@ class ReconfigurationCorrelationResult:
     min_pairs: int
     contiguous_time_per_site_ns: Optional[np.ndarray] = None
     dataset_label: str = "data"
+    # Optional fields keep older cached correlation objects reconstructible.
+    window_size: Optional[int] = None
+    distance_pairs: tuple[tuple[int, int], ...] = ()
+    distance_weighting: Optional[str] = None
+    window_residue_numbers: Optional[np.ndarray] = None
 
     @property
     def n_chains(self) -> int:
@@ -289,7 +297,7 @@ class ReconfigurationTimeResult:
         if field not in {"tau_fast_ns", "tau_slow_ns", "fast_fraction"}:
             raise ValueError("unknown biexponential component field")
         values = np.full(len(self.chain_labels), np.nan, dtype=float)
-        if self.kind == "torsions" and self.residue_averaging == "common":
+        if self.residue_numbers is not None and self.residue_averaging == "common":
             if self.residue_numbers is None or self.summary_residue_numbers is None:
                 return values
             selected = np.isin(self.residue_numbers, self.summary_residue_numbers)
@@ -605,6 +613,7 @@ def calculate_reconfiguration_correlations(
     lag_stride: int = 1,
     kinetic_scale: float = 1.0,
     torsion_weighting: str = "equal",
+    distance_weighting: str = "variance",
     require_all_angles: bool = True,
     min_pairs: int = 20,
     min_variance: float = 1e-12,
@@ -612,7 +621,21 @@ def calculate_reconfiguration_correlations(
     correlation_dtype: str = "float32",
     max_output_gib: float = 2.0,
 ) -> Any:
-    """Compute connected Rg/scalar or circular torsion autocorrelations.
+    """Compute connected scalar, circular torsion, or segment-shape correlations.
+
+    SegmentDistanceResult (feature_type='internal_distances') is detected
+    automatically; observable='segment-shape' is an explicit alias. Each window
+    is addressed by its CENTRAL PDB residue number using the existing residue
+    selectors. distance_weighting='variance' computes the connected vector ACF
+    sum_j <delta d_j(s) delta d_j(s+t)> / sum_j <delta d_j**2>, NOT the ACF of
+    sum_j d_j. Constant components contribute zero; a wholly constant vector is
+    undefined. 'equal' standardizes fluctuating components before the vector
+    ACF, giving their normalized correlations equal weights. All components use
+    a common finite frame mask; an incomplete vector creates a temporal break.
+    min_variance for raw distances is in nm^2. Stored distances are never scaled
+    by kinetic_scale. resnum/residue_range/residues select window CENTERS, not
+    their outer boundaries. No incomplete terminal windows are introduced.
+
 
     Input may be one cached Rg/torsion result, a 1D/2D scalar array, a mapping of
     fields, or a flat mapping {dataset_key: result}; output preserves that shape.
@@ -656,10 +679,14 @@ def calculate_reconfiguration_correlations(
     Computational cost is O(N log N) per chain/residue/angle. Output memory is
     bounded by max_output_gib (angles are processed one series at a time).
     """
-    is_torsion = _field(data, "chains") is not None and _field(data, "unit") is not None
+    is_shape = _field(data, "feature_type") == "internal_distances"
+    is_torsion = (
+        not is_shape and _field(data, "chains") is not None and _field(data, "unit") is not None
+    )
+    is_residue_resolved = is_torsion or is_shape
     field = "rg_per_chain_nm" if observable in {"auto", "rg", "rgyr"} else str(observable)
     is_scalar = _field(data, field) is not None or isinstance(data, np.ndarray)
-    if isinstance(data, Mapping) and not is_torsion and not is_scalar:
+    if isinstance(data, Mapping) and not is_residue_resolved and not is_scalar:
         if not data:
             raise ValueError("data mapping is empty")
         for name, spec in (
@@ -703,6 +730,7 @@ def calculate_reconfiguration_correlations(
                 lag_stride=lag_stride,
                 kinetic_scale=kinetic_scale,
                 torsion_weighting=torsion_weighting,
+                distance_weighting=distance_weighting,
                 require_all_angles=require_all_angles,
                 min_pairs=min_pairs,
                 min_variance=min_variance,
@@ -728,6 +756,8 @@ def calculate_reconfiguration_correlations(
     lag_stride = _integer(lag_stride, "lag_stride", 1)
     if not np.isfinite(min_variance) or min_variance < 0:
         raise ValueError("min_variance must be finite and nonnegative")
+    if distance_weighting not in {"equal", "variance"}:
+        raise ValueError("distance_weighting must be 'equal' or 'variance'")
     if torsion_weighting not in {"equal", "variance"}:
         raise ValueError("torsion_weighting must be 'equal' or 'variance'")
     if not isinstance(require_all_angles, (bool, np.bool_)):
@@ -738,18 +768,51 @@ def calculate_reconfiguration_correlations(
     if not np.isfinite(max_output_gib) or max_output_gib <= 0:
         raise ValueError("max_output_gib must be finite and positive")
 
-    if is_torsion:
-        if observable not in {"auto", "torsions", "peptide-torsions"}:
-            raise ValueError("for torsion results, select angle names with torsions=...")
-        names = _torsion_names(torsions)
+    window_size = None
+    distance_pairs = ()
+    window_members = None
+    if is_residue_resolved:
+        if is_shape:
+            if observable not in {
+                "auto",
+                "segment-shape",
+                "segment_shape",
+                "internal-distances",
+                "internal_distances",
+            }:
+                raise ValueError(
+                    "segment distance data require observable='auto' or 'segment-shape'"
+                )
+            if str(_field(data, "unit", "nm")).lower() != "nm":
+                raise ValueError("segment distances must be stored in nm")
+            if str(_field(data, "atom_name", "CA")).upper() != "CA":
+                raise ValueError("segment distance correlations currently require CA distances")
+            window_size = _integer(_field(data, "window_size"), "window_size", 3)
+            if window_size % 2 != 1:
+                raise ValueError("window_size must be odd")
+            offsets = np.asarray(_field(data, "pair_offsets"))
+            if offsets.ndim != 2 or offsets.shape[1] != 2 or len(offsets) == 0:
+                raise ValueError("pair_offsets must be a nonempty (n_components, 2) array")
+            distance_pairs = tuple(
+                tuple(_integer(v, "pair offset", 0) for v in row) for row in offsets
+            )
+            if len(set(distance_pairs)) != len(distance_pairs) or any(
+                a >= b or b >= window_size for a, b in distance_pairs
+            ):
+                raise ValueError("pair_offsets must be unique ordered pairs within the window")
+            names = tuple(f"CA[{a},{b}]@window{window_size}" for a, b in distance_pairs)
+        else:
+            if observable not in {"auto", "torsions", "peptide-torsions"}:
+                raise ValueError("for torsion results, select angle names with torsions=...")
+            names = _torsion_names(torsions)
         chains = _field(data, "chains")
         if not chains:
             raise ValueError(
-                "torsion result has no atomistic chains; select a nonempty peptide group"
+                "residue-resolved result has no chains; select a nonempty peptide group"
             )
         labels = tuple(str(x) for x in chains)
         if any(not isinstance(x, str) for x in chains):
-            raise TypeError("torsion chain keys must be strings")
+            raise TypeError("chain keys must be strings")
         indices = _chain_indices(
             labels, chain_indices, include_chains, exclude_chains, strict_chain_selection, True
         )
@@ -771,14 +834,35 @@ def calculate_reconfiguration_correlations(
             raise ValueError(f"residue numbers absent from every selected chain: {missing}")
         if not numbers.size:
             raise ValueError("residue selection is empty")
-        unit = str(_field(data, "unit")).lower()
-        if unit not in {"radians", "degrees", "radian", "degree", "rad", "deg"}:
-            raise ValueError(f"unknown torsion unit {unit!r}")
-        angle_scale = math.pi / 180.0 if unit in {"degrees", "degree", "deg"} else 1.0
+        if is_torsion:
+            unit = str(_field(data, "unit")).lower()
+            if unit not in {"radians", "degrees", "radian", "degree", "rad", "deg"}:
+                raise ValueError(f"unknown torsion unit {unit!r}")
+            angle_scale = math.pi / 180.0 if unit in {"degrees", "degree", "deg"} else 1.0
+        else:
+            member_lookup = {}
+            wanted_centers = set(numbers.tolist())
+            for label in selected_labels:
+                local = per_chain_numbers[label]
+                member_array = np.asarray(_field(chains[label], "window_residue_numbers"))
+                if member_array.shape != (len(local), window_size):
+                    raise ValueError(f"{label}: window_residue_numbers has an incompatible shape")
+                for center, row in zip(local, member_array):
+                    if center not in wanted_centers:
+                        continue
+                    group = tuple(_integer(v, "window residue number") for v in row)
+                    if group[window_size // 2] != center or len(set(group)) != window_size:
+                        raise ValueError(f"{label}: invalid members for window center {center}")
+                    if center in member_lookup and member_lookup[center] != group:
+                        raise ValueError(
+                            f"window centered at {center} has different residue members across selected chains"
+                        )
+                    member_lookup[center] = group
+            window_members = np.array([member_lookup[int(v)] for v in numbers], dtype=np.int64)
         n_sites = len(numbers)
     else:
         if any(x is not None for x in (resnum, residue_range, residues)):
-            raise ValueError("residue selection only applies to torsion results")
+            raise ValueError("residue selection requires torsion or segment-distance results")
         values = np.asarray(
             data if isinstance(data, np.ndarray) else _field(data, field), dtype=float
         )
@@ -881,17 +965,57 @@ def calculate_reconfiguration_correlations(
     longest_global = max(right - left - 1 for left, right in _runs(np.ones(n, dtype=bool), breaks))
     support = np.zeros(shape[:2], dtype=float)
     for ci, label in enumerate(selected_labels):
-        if is_torsion:
+        if is_residue_resolved:
             chain = chains[label]
             local_numbers = per_chain_numbers[label]
             lookup = {int(number): row for row, number in enumerate(local_numbers)}
             arrays = []
-            for name in names:
-                array = np.asarray(_field(chain, name))
-                if array.shape != (len(local_numbers), n_frames):
-                    raise ValueError(f"{label}: {name} must have shape (residues, frames)")
-                arrays.append(array)
+            if is_shape:
+                vectors = np.asarray(_field(chain, "distance_vectors_nm"))
+                if vectors.shape != (len(local_numbers), len(names), n_frames):
+                    raise ValueError(
+                        f"{label}: distance_vectors_nm must have shape (windows, components, frames)"
+                    )
+            else:
+                for name in names:
+                    array = np.asarray(_field(chain, name))
+                    if array.shape != (len(local_numbers), n_frames):
+                        raise ValueError(f"{label}: {name} must have shape (residues, frames)")
+                    arrays.append(array)
         for ri in range(n_sites):
+            if is_shape:
+                row = lookup.get(int(numbers[ri]))
+                if row is None:
+                    continue
+                features = np.array(vectors[row, :, start:stop].T, dtype=float, copy=True)
+                complete = np.all(np.isfinite(features), axis=1)
+                if np.any(features[complete] < 0):
+                    raise ValueError("internal distances must be nonnegative")
+                features[~complete] = np.nan
+                if np.any(complete):
+                    v = np.var(features[complete], axis=0)
+                    variance[ci, ri] = v
+                    status[ci, ri] = np.where(v > min_variance, "ok", "constant")
+                    if distance_weighting == "equal":
+                        active = v > min_variance
+                        if np.any(active):
+                            features[:, active] /= np.sqrt(v[active])
+                            features[np.ix_(complete, ~active)] = 0.0
+                        else:
+                            features[complete] = 0.0
+                corr, pairs, _, why, longest = _connected_acf(
+                    features,
+                    breaks,
+                    limit,
+                    min_pairs,
+                    min_variance if distance_weighting == "variance" else 0.0,
+                )
+                if why not in {"ok", "constant"}:
+                    status[ci, ri] = why
+                acfs[ci, ri] = corr[lag_frames]
+                counts[ci, ri] = pairs[lag_frames]
+                support[ci, ri] = longest
+                continue
             if is_torsion:
                 row = lookup.get(int(numbers[ri]))
                 if row is None:
@@ -949,7 +1073,7 @@ def calculate_reconfiguration_correlations(
         chain_labels=selected_labels,
         residue_numbers=numbers,
         observables=names,
-        kind="torsions" if is_torsion else "scalar",
+        kind="segment_shape" if is_shape else ("torsions" if is_torsion else "scalar"),
         component_variance=variance,
         circular_plateau=plateau,
         component_status=status,
@@ -963,6 +1087,10 @@ def calculate_reconfiguration_correlations(
         torsion_weighting=torsion_weighting,
         require_all_angles=bool(require_all_angles),
         min_pairs=min_pairs,
+        window_size=window_size,
+        distance_pairs=distance_pairs,
+        distance_weighting=distance_weighting if is_shape else None,
+        window_residue_numbers=window_members,
     )
     # Store per-site support as a declared field below, not as transient attributes.
     return replace(result, contiguous_time_per_site_ns=support * physical_dt)
@@ -1499,7 +1627,7 @@ class ReconfigurationAggregateTimeResult:
         if resnum is None:
             return self.bootstrap_fits, self.n_chains, self.fit
         if self.residue_numbers is None:
-            raise ValueError("resnum applies only to residue-resolved torsion fits")
+            raise ValueError("resnum applies only to residue-resolved fits")
         match = np.flatnonzero(self.residue_numbers == _integer(resnum, "resnum"))
         if match.size != 1:
             raise ValueError(f"residue {resnum} is not present")
@@ -1750,7 +1878,7 @@ class ReconfigurationSetAggregateTimeResult(ReconfigurationAggregateTimeResult):
         if resnum is None:
             return self.bootstrap_fits, self.n_sets, self.fit
         if self.residue_numbers is None:
-            raise ValueError("resnum applies only to residue-resolved torsion fits")
+            raise ValueError("resnum applies only to residue-resolved fits")
         match = np.flatnonzero(self.residue_numbers == _integer(resnum, "resnum"))
         if match.size != 1:
             raise ValueError(f"residue {resnum} is not present")
@@ -1863,7 +1991,15 @@ def _prepare_simulation_means(
                 "simulation lag grids differ; recalculate with matching dt, "
                 "kinetic_scale and lag_stride (no implicit interpolation)"
             )
-        for field in ("kind", "observables", "torsion_weighting", "require_all_angles"):
+        for field in (
+            "kind",
+            "observables",
+            "torsion_weighting",
+            "require_all_angles",
+            "window_size",
+            "distance_pairs",
+            "distance_weighting",
+        ):
             if getattr(item, field) != getattr(first, field):
                 raise ValueError(f"{name}: incompatible {field} across simulation sets")
         for field in ("dt_ns", "kinetic_scale"):
@@ -1886,7 +2022,7 @@ def _prepare_simulation_means(
             RuntimeWarning,
             stacklevel=3,
         )
-    torsions = first.kind == "torsions"
+    torsions = first.residue_numbers is not None
     if torsions:
         local_numbers = []
         for name, item in zip(labels, items):
@@ -1904,6 +2040,21 @@ def _prepare_simulation_means(
         numbers = None
         local_numbers = [np.array([0]) for _ in items]
     n_sites = len(numbers) if torsions else 1
+    combined_members = None
+    if first.kind == "segment_shape":
+        member_lookup = {}
+        for name, item, local in zip(labels, items, local_numbers):
+            members = np.asarray(item.window_residue_numbers)
+            if members.shape != (len(local), first.window_size):
+                raise ValueError(f"{name}: invalid window_residue_numbers")
+            for center, row in zip(local, members):
+                group = tuple(int(v) for v in row)
+                if center in member_lookup and member_lookup[center] != group:
+                    raise ValueError(
+                        f"window {center} spans different residues across simulation sets"
+                    )
+                member_lookup[center] = group
+        combined_members = np.array([member_lookup[int(v)] for v in numbers], dtype=np.int64)
     n_sets = len(items)
     means = np.full((n_sets, n_sites, n_lags), np.nan)
     pair_counts = np.zeros(means.shape, dtype=np.int64)
@@ -2017,6 +2168,10 @@ def _prepare_simulation_means(
         require_all_angles=first.require_all_angles,
         min_pairs=max(item.min_pairs for item in items),
         dataset_label="all_sets",
+        window_size=first.window_size,
+        distance_pairs=first.distance_pairs,
+        distance_weighting=first.distance_weighting,
+        window_residue_numbers=combined_members,
     )
     if warn and (
         not np.all(common_sets)
@@ -2132,7 +2287,7 @@ def _fit_aggregate_correlations(
         overall_mask = np.asarray(overall_mask_override, dtype=bool)
         if overall_mask.shape != eligible.shape or np.any(overall_mask & ~eligible):
             raise ValueError("overall mask must select eligible contributors")
-    elif correlations.kind == "torsions" and residue_averaging == "common":
+    elif correlations.residue_numbers is not None and residue_averaging == "common":
         common = np.all(eligible, axis=0)
         if not np.any(common):
             raise ValueError(
@@ -2192,7 +2347,7 @@ def _fit_aggregate_correlations(
         )
 
     main = point_fit(mean, global_duration)
-    if correlations.kind == "torsions":
+    if correlations.residue_numbers is not None:
         site_fits = tuple(
             (
                 point_fit(site_means[ri], float(np.min(support[eligible[:, ri], ri])))
@@ -2203,7 +2358,7 @@ def _fit_aggregate_correlations(
         )
     else:
         site_fits = (main,)
-    if correlations.kind != "torsions" and n_sites != 1:
+    if correlations.residue_numbers is None and n_sites != 1:
         raise ValueError("scalar aggregate input must have exactly one site")
 
     # Bootstrap model and window are conditional on original aggregate choices.
@@ -2261,7 +2416,7 @@ def _fit_aggregate_correlations(
         for indices in draws:
             sampled_mean = _fixed_chain_mean(rows[indices], active[indices])
             main_boot.append(bootstrap_fit(sampled_mean, main, global_duration))
-            if correlations.kind == "torsions":
+            if correlations.residue_numbers is not None:
                 for ri, point in enumerate(site_fits):
                     sampled_site = _fixed_chain_mean(data[indices, ri, :], eligible[indices, ri])
                     duration = (
@@ -2270,7 +2425,7 @@ def _fit_aggregate_correlations(
                         else global_duration
                     )
                     site_boot[ri].append(bootstrap_fit(sampled_site, point, duration))
-        if correlations.kind != "torsions":
+        if correlations.residue_numbers is None:
             site_boot[0] = main_boot
     elif n_bootstrap and warn:
         warnings.warn(
@@ -2315,7 +2470,7 @@ def _fit_aggregate_correlations(
             if bootstrap_unit != "set" or np.any(eligible[:, ri])
             for item in items
         )
-        if failed or (correlations.kind == "torsions" and profile_failed):
+        if failed or (correlations.residue_numbers is not None and profile_failed):
             warnings.warn(
                 f"Numerical bootstrap failures: overall={failed}/{len(main_boot)}; "
                 f"site-level={profile_failed}. Replicates are retained; affected SE/CI "
@@ -2774,7 +2929,7 @@ def fit_reconfiguration_times(
                 accepted[ci, ri] = True
         fits[label] = tuple(chain_fits)
     profile_mean, profile_std, profile_sem, profile_count = _stats(tau_grid, axis=0)
-    if correlations.kind == "torsions" and residue_averaging == "common":
+    if correlations.residue_numbers is not None and residue_averaging == "common":
         common = np.all(accepted, axis=0)
         for_summary = np.where(common[None, :], tau_grid, np.nan)
         summary_numbers = correlations.residue_numbers[common].copy()
@@ -3066,7 +3221,7 @@ def plot_reconfiguration_correlations(
         site = None
         if resnum is not None:
             if raw.residue_numbers is None:
-                raise ValueError("resnum applies only to torsion correlations")
+                raise ValueError("resnum applies only to residue-resolved correlations")
             matched = np.flatnonzero(raw.residue_numbers == _integer(resnum, "resnum"))
             if len(matched) != 1:
                 raise ValueError(f"{key}: residue {resnum} not present")
@@ -3147,7 +3302,7 @@ def plot_reconfiguration_correlations(
                 if (
                     not include_flagged_fits
                     and site is None
-                    and fit.kind == "torsions"
+                    and fit.residue_numbers is not None
                     and fit.residue_averaging == "common"
                 ):
                     mask &= np.isin(raw.residue_numbers, fit.summary_residue_numbers)[None, :]
@@ -3699,7 +3854,7 @@ def plot_reconfiguration_times(
     prepared = []
     for dataset_index, (key, fit) in enumerate(items):
         if fit.residue_numbers is None:
-            raise ValueError("residue profiles require torsion fits, not scalar/Rg fits")
+            raise ValueError("residue profiles require residue-resolved fits, not scalar/Rg fits")
         aggregate_mode = isinstance(fit, ReconfigurationAggregateTimeResult)
         set_mode = isinstance(fit, ReconfigurationSetAggregateTimeResult)
         if not set_mode and min_sets > 1:

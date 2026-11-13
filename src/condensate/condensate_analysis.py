@@ -8,6 +8,7 @@ dispatch layer for common trajectory analyses.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import math
@@ -40,6 +41,8 @@ from mdsim.analysis import (
     RadialTranslationalDiffusionFitResult,
     RadialTranslationalMSDResult,
     ResidueDensityProfileResult,
+    SegmentDistanceChainResult,
+    SegmentDistanceResult,
     SiteRDFResult,
     TranslationalDiffusionFitResult,
     TranslationalMSDResult,
@@ -58,6 +61,7 @@ from mdsim.analysis import (
     reference_center_distances_from_dcd,
     residue_density_profile_from_dcd,
     rg_from_dcd,
+    segment_internal_distances_from_dcd,
     site_rdf_from_dcd,
     translational_msd_from_trajectories,
     yeh_hummer_diffusion_correction,
@@ -468,6 +472,9 @@ __all__ = [
     "PeptideTorsionChainResult",
     "PeptideTorsionResult",
     "peptide_torsions_from_dcd",
+    "SegmentDistanceChainResult",
+    "SegmentDistanceResult",
+    "segment_internal_distances_from_dcd",
     "MSDFitResult",
     "MSDResult",
     "ChainCOMTrajectoryResult",
@@ -6476,13 +6483,13 @@ def _is_density_profile_calculation(calc: str) -> bool:
 
 
 def _selected_peptide_torsions(
-    result: PeptideTorsionResult,
+    result: Union[PeptideTorsionResult, SegmentDistanceResult],
     pdb_file: PathLike,
     selection: Any,
-) -> PeptideTorsionResult:
+) -> Union[PeptideTorsionResult, SegmentDistanceResult]:
     """Keep all residues of each atomistic chain touched by a group selection.
 
-    mdsim.peptide_torsions_from_dcd currently analyzes every atomistic chain;
+    Peptide torsions and segment distances may contain every atomistic chain;
     notebook ``segs`` values identify which physical chains belong to a group.
     A residue- or atom-restricted selector is used to *identify chains*, not to
     remove other residues from those chains.
@@ -6578,8 +6585,20 @@ def calculate(
     check_peptide_bonds: bool = True,
     peptide_bond_cutoff_nm: float = 0.22,
     torsion_dtype: Any = "float32",
+    window_size: int = 5,
+    min_sequence_separation: int = 2,
+    segment_dtype: Any = "float32",
+    segment_max_output_gib: float = 4.0,
 ) -> Any:
     """Run one of the common notebook analyses.
+
+    calc='segment-distances' extracts CA internal-distance vectors in odd-length
+    peptide windows. window_size=5 and min_sequence_separation=2 give six pairs.
+    Returns SegmentDistanceResult; center PDB numbers index its windows.
+    segment_dtype controls storage, segment_max_output_gib the final array cap.
+    As for torsions, pbc is inherited from this general wrapper (True); specify
+    pbc=False for locally whole chains. time_start/time_stop use delta_t BEFORE
+    stride; the saved samples have spacing delta_t*stride.
 
     Supported values for ``calc`` are ``rgyr``, ``contacts``, ``centerdist``,
     ``densityprofile``, ``intrachain``, ``interchain``, ``mincontact``,
@@ -6717,6 +6736,8 @@ def calculate(
         "peptidetorsions": "peptide_torsions",
         "torsions": "peptide_torsions",
         "torsion": "peptide_torsions",
+        "internal_distance_vectors": "segment_distances",
+        "segment_shape": "segment_distances",
     }
     calc_key = aliases.get(calc_key, calc_key)
 
@@ -6754,7 +6775,7 @@ def calculate(
             selection_atom_name,
         )
 
-    if calc_key == "peptide_torsions":
+    if calc_key in {"peptide_torsions", "segment_distances"}:
         # Time limits are interpreted on the strided trajectory frame grid.
         uses_time = time_start is not None or time_stop is not None
         if uses_time and (int(frame_start) != 0 or frame_stop is not None):
@@ -6773,6 +6794,24 @@ def calculate(
             if last is not None and last <= first:
                 raise ValueError("time window selects no torsion frames")
 
+        if calc_key == "segment_distances":
+            return segment_internal_distances_from_dcd(
+                pdb_file=Path(pdb),
+                dcd_files=dcd_files,
+                selection=selection,
+                window_size=window_size,
+                min_sequence_separation=min_sequence_separation,
+                pbc=pbc,
+                box_nm=box_nm,
+                check_peptide_bonds=check_peptide_bonds,
+                peptide_bond_cutoff_nm=peptide_bond_cutoff_nm,
+                stride=stride,
+                chunk=chunk,
+                frame_start=first,
+                frame_stop=last,
+                dtype=segment_dtype,
+                max_output_gib=segment_max_output_gib,
+            )
         all_torsions = peptide_torsions_from_dcd(
             pdb_file=Path(pdb),
             dcd_files=dcd_files,
@@ -7217,7 +7256,7 @@ def calculate(
             **common,
         )
 
-    supported = "rgyr, contacts, centerdist, comtraj, densityprofile, intrachain, interchain, mincontact, distmsd, distmsd1d, distmsdmap, contactmap, peptide-torsions"
+    supported = "rgyr, contacts, centerdist, comtraj, densityprofile, intrachain, interchain, mincontact, distmsd, distmsd1d, distmsdmap, contactmap, peptide-torsions, segment-distances"
     raise ValueError(f"unknown calculation type {calc!r}; choose one of: {supported}")
 
 
@@ -7292,6 +7331,10 @@ def _get_values_serial(
     check_peptide_bonds: bool = True,
     peptide_bond_cutoff_nm: float = 0.22,
     torsion_dtype: Any = "float32",
+    window_size: int = 5,
+    min_sequence_separation: int = 2,
+    segment_dtype: Any = "float32",
+    segment_max_output_gib: float = 4.0,
 ) -> dict[str, Any]:
     """Calculate or load cached results for each set/group combination.
 
@@ -7364,6 +7407,12 @@ def _get_values_serial(
     calc_key = str(calc).strip().lower().replace("-", "_")
     is_comtraj = calc_key in {"comtraj", "com_trajectory", "chain_com", "translational_trajectory"}
     is_peptide_torsions = calc_key in {"peptide_torsions", "peptidetorsions", "torsion", "torsions"}
+    is_segment_distances = calc_key in {
+        "segment_distances",
+        "internal_distance_vectors",
+        "segment_shape",
+    }
+    is_chain_resolved = is_peptide_torsions or is_segment_distances
     is_distmsdmap = calc_key in {
         "distmsdmap",
         "dist_msd_map",
@@ -7390,7 +7439,9 @@ def _get_values_serial(
         dcd_file = root / set_name / dcd_name
         # mdsim evaluates all atomistic chains, irrespective of the group.
         # Reuse one calculation across groups within this simulation set.
-        all_torsions_for_set: Optional[PeptideTorsionResult] = None
+        all_chain_results_for_set: Optional[Union[PeptideTorsionResult, SegmentDistanceResult]] = (
+            None
+        )
 
         for group_label, selection in segs.items():
             group_name = str(group_label)
@@ -7407,6 +7458,34 @@ def _get_values_serial(
                     else ".no-bond-check"
                 )
                 cache_calc_label += f".{np.dtype(torsion_dtype).name}"
+            if is_segment_distances:
+                settings = {
+                    "window_size": window_size,
+                    "min_sequence_separation": min_sequence_separation,
+                    "dtype": np.dtype(segment_dtype).name,
+                    "pbc": bool(pbc),
+                    "box_nm": str(box_nm),
+                    "check_peptide_bonds": bool(check_peptide_bonds),
+                    "peptide_bond_cutoff_nm": float(peptide_bond_cutoff_nm),
+                    "stride": stride,
+                    "frame_start": frame_start,
+                    "frame_stop": frame_stop,
+                    "time_start": str(time_start),
+                    "time_stop": str(time_stop),
+                    "delta_t": str(delta_t),
+                    "selection": selection,
+                    "pdb_name": str(pdb_name),
+                    "dcd_name": str(dcd_name),
+                }
+                fingerprint = hashlib.sha256(
+                    json.dumps(settings, sort_keys=True, default=str, separators=(",", ":")).encode(
+                        "utf-8"
+                    )
+                ).hexdigest()[:16]
+                cache_calc_label = (
+                    f"segment-distances{tag}.w{window_size}.sep{min_sequence_separation}."
+                    f"{np.dtype(segment_dtype).name}.{fingerprint}"
+                )
             if (
                 is_densityprofile
                 or is_residuedensity
@@ -7459,14 +7538,16 @@ def _get_values_serial(
                         )
                     refsel_for_key = refsel[key]
 
-                if is_peptide_torsions and all_torsions_for_set is not None:
-                    value = _selected_peptide_torsions(all_torsions_for_set, pdb_file, selection)
+                if is_chain_resolved and all_chain_results_for_set is not None:
+                    value = _selected_peptide_torsions(
+                        all_chain_results_for_set, pdb_file, selection
+                    )
                 else:
                     value = calculate(
                         calc=calc,
                         pdb=pdb_file,
                         dcd=dcd_file,
-                        selection="all" if is_peptide_torsions else selection,
+                        selection="all" if is_chain_resolved else selection,
                         selection2=sel2,
                         refsel=refsel_for_key,
                         pairsel=pairsel,
@@ -7517,11 +7598,15 @@ def _get_values_serial(
                         check_peptide_bonds=check_peptide_bonds,
                         peptide_bond_cutoff_nm=peptide_bond_cutoff_nm,
                         torsion_dtype=torsion_dtype,
+                        window_size=window_size,
+                        min_sequence_separation=min_sequence_separation,
+                        segment_dtype=segment_dtype,
+                        segment_max_output_gib=segment_max_output_gib,
                     )
-                    if is_peptide_torsions:
-                        all_torsions_for_set = value
+                    if is_chain_resolved:
+                        all_chain_results_for_set = value
                         value = _selected_peptide_torsions(
-                            all_torsions_for_set, pdb_file, selection
+                            all_chain_results_for_set, pdb_file, selection
                         )
                 save_data(cache_file, value)
                 data[key] = value
@@ -7628,8 +7713,20 @@ def get_values(
     check_peptide_bonds: bool = True,
     peptide_bond_cutoff_nm: float = 0.22,
     torsion_dtype: Any = "float32",
+    window_size: int = 5,
+    min_sequence_separation: int = 2,
+    segment_dtype: Any = "float32",
+    segment_max_output_gib: float = 4.0,
 ) -> dict[str, Any]:
     """Calculate/load results, optionally parallelizing independent set/group jobs.
+
+    calc='segment-distances' caches sliding-window CA distance vectors, read
+    once per simulation across groups, like peptide-torsions. Defaults are
+    window_size=5, min_sequence_separation=2, segment_dtype='float32'. All
+    geometric/frame/selection parameters are encoded in these NEW cache names;
+    use overwrite=True or a new tag after replacing trajectory file contents.
+    Specify pbc=False for whole chains (the general wrapper default is True).
+    Memory caps apply per simulation; parallel sets multiply peak usage.
 
     ``calc="peptide-torsions"`` returns one mdsim PeptideTorsionResult per
     set/group with only the selected physical chains. Radians are the default.
@@ -7664,10 +7761,16 @@ def get_values(
     backend_name = _parallel_backend_name(parallel_backend)
     calc_key = str(calc).strip().lower().replace("-", "_")
     is_peptide_torsions = calc_key in {"peptide_torsions", "peptidetorsions", "torsion", "torsions"}
+    is_segment_distances = calc_key in {
+        "segment_distances",
+        "internal_distance_vectors",
+        "segment_shape",
+    }
+    is_chain_resolved = is_peptide_torsions or is_segment_distances
 
     # The mdsim torsion routine processes all atomistic chains per DCD.
     # With one set, run the groups together so the DCD is read just once.
-    if n_outer == 1 or (len(sets) * len(segs)) <= 1 or (is_peptide_torsions and len(sets) <= 1):
+    if n_outer == 1 or (len(sets) * len(segs)) <= 1 or (is_chain_resolved and len(sets) <= 1):
         return _get_values_serial(
             sets,
             segs,
@@ -7728,6 +7831,10 @@ def get_values(
             check_peptide_bonds=check_peptide_bonds,
             peptide_bond_cutoff_nm=peptide_bond_cutoff_nm,
             torsion_dtype=torsion_dtype,
+            window_size=window_size,
+            min_sequence_separation=min_sequence_separation,
+            segment_dtype=segment_dtype,
+            segment_max_output_gib=segment_max_output_gib,
         )
 
     common_kwargs = dict(
@@ -7788,9 +7895,13 @@ def get_values(
         check_peptide_bonds=check_peptide_bonds,
         peptide_bond_cutoff_nm=peptide_bond_cutoff_nm,
         torsion_dtype=torsion_dtype,
+        window_size=window_size,
+        min_sequence_separation=min_sequence_separation,
+        segment_dtype=segment_dtype,
+        segment_max_output_gib=segment_max_output_gib,
     )
 
-    if is_peptide_torsions:
+    if is_chain_resolved:
         # Parallelize independent sets, rather than groups from the same DCD.
         # Each worker creates and caches all requested group results in one pass.
         Executor = ThreadPoolExecutor if backend_name == "thread" else ProcessPoolExecutor
@@ -7808,7 +7919,7 @@ def get_values(
                     merged.update(future.result())
                 except Exception as exc:
                     raise RuntimeError(
-                        f"parallel peptide-torsions calculation failed for set {set_name!r}"
+                        f"parallel {calc} calculation failed for set {set_name!r}"
                     ) from exc
         return {
             f"{set_label}_{group_label}": merged[f"{set_label}_{group_label}"]
