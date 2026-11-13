@@ -2672,9 +2672,294 @@ def plot_reconfiguration_correlations(
     return fig, ax
 
 
+def _time_profile_components(components: Union[str, Sequence[str]]) -> tuple[str, ...]:
+    """Normalize requested residue-profile time components."""
+    if isinstance(components, str):
+        names = (
+            ("overall", "fast", "slow") if components.strip().lower() == "all" else (components,)
+        )
+    elif isinstance(components, Sequence) and not isinstance(components, (str, bytes)):
+        names = tuple(components)
+    else:
+        raise TypeError("components must be a name or sequence of names")
+    if not names:
+        raise ValueError("components must not be empty")
+    aliases = {"overall": "overall", "effective": "overall", "fast": "fast", "slow": "slow"}
+    normalized = []
+    for name in names:
+        if not isinstance(name, str) or name.strip().lower() not in aliases:
+            raise ValueError(
+                "components must contain 'overall' (or 'effective'), 'fast', or 'slow'"
+            )
+        normalized.append(aliases[name.strip().lower()])
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("components contains duplicate names")
+    return tuple(normalized)
+
+
+def _time_profile_component_style(specification: Any, name: str) -> dict[str, Any]:
+    """Validate component-keyed styling without changing dataset styling."""
+    if specification is None:
+        return {}
+    if not isinstance(specification, Mapping):
+        raise TypeError(f"{name} must be a mapping keyed by overall, fast, or slow")
+    result: dict[str, Any] = {}
+    for key, value in specification.items():
+        normalized = _time_profile_components(key)
+        if len(normalized) != 1:
+            raise ValueError(f"{name} keys must name individual components, not 'all'")
+        component = normalized[0]
+        if component in result:
+            raise ValueError(f"{name} specifies {component!r} more than once")
+        result[component] = value
+    return result
+
+
+def _residue_time_profile(
+    fit: Any,
+    component: str,
+    uncertainty: Optional[str],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Extract estimates, errors, counts, and optional chain rows in ns.
+
+    Fast/slow values exist ONLY for accepted double-exponential fits. Overall
+    is the effective integral time for any supported model. In aggregate mode,
+    errors come from that same parameter's per-residue bootstrap distribution.
+    """
+    parameter = {"overall": "tau_ns", "fast": "tau_fast_ns", "slow": "tau_slow_ns"}[component]
+    n_sites = len(fit.residue_numbers)
+    if isinstance(fit, ReconfigurationAggregateTimeResult):
+        if len(fit.residue_fits) != n_sites:
+            raise ValueError("residue_fits does not match residue_numbers")
+        values = np.full(n_sites, np.nan, dtype=float)
+        errors = np.full(n_sites, np.nan, dtype=float)
+        counts = np.zeros(n_sites, dtype=np.int64)
+        for index, (number, item) in enumerate(zip(fit.residue_numbers, fit.residue_fits)):
+            if not item.accepted or (component != "overall" and item.model != "double"):
+                continue
+            value = float(getattr(item, parameter))
+            if not np.isfinite(value):
+                continue
+            values[index] = value
+            counts[index] = int(fit.residue_n_chains[index])
+            if uncertainty == "sem":
+                errors[index] = fit.standard_error(parameter, resnum=int(number))
+        return values, errors, counts, None
+
+    expected = (len(fit.chain_labels), n_sites)
+    accepted = np.asarray(fit.accepted, dtype=bool)
+    if accepted.shape != expected:
+        raise ValueError("accepted mask does not match chain/residue dimensions")
+    if component == "overall":
+        # Preserve the existing effective-time summary exactly, including gaps.
+        rows = np.asarray(fit.tau_per_chain_residue_ns, dtype=float)
+        if rows.shape != expected:
+            raise ValueError("tau_per_chain_residue_ns does not match chain/residue dimensions")
+        rows = np.where(accepted & np.isfinite(rows), rows, np.nan)
+    else:
+        rows = np.full(expected, np.nan, dtype=float)
+        for ci, chain in enumerate(fit.chain_labels):
+            entries = fit.fits[chain]
+            if len(entries) != n_sites:
+                raise ValueError(f"{chain!r}: fitted site count does not match residue_numbers")
+            for ri, item in enumerate(entries):
+                if not (accepted[ci, ri] and item.accepted and item.model == "double"):
+                    continue
+                value = float(getattr(item, parameter))
+                if np.isfinite(value):
+                    rows[ci, ri] = value
+    mean, sd, sem, counts = _stats(rows, axis=0)
+    errors = sd if uncertainty == "std" else sem
+    if uncertainty is None:
+        errors = np.full(n_sites, np.nan, dtype=float)
+    return mean, errors, counts, rows
+
+
+def _prepare_time_reference_lines(
+    reference_values: Any,
+    *,
+    reference_time_unit: str,
+    time_unit: str,
+    yscale: str,
+) -> list[dict[str, Any]]:
+    """Validate reference specifications and convert their times to display units.
+
+    Validation happens before drawing, so a malformed reference does not leave
+    a partially modified plot. Numeric input defaults to ns; each mapping may
+    override the input unit without changing the displayed axis unit.
+    """
+    if reference_values is None:
+        return []
+    from matplotlib.colors import to_rgba
+    from matplotlib.lines import Line2D
+
+    display_factor, _ = _plot_scale(time_unit)
+    if not isinstance(reference_time_unit, str):
+        raise TypeError("reference_time_unit must be a time-unit string")
+    _plot_scale(reference_time_unit)
+    if isinstance(reference_values, Mapping) or np.isscalar(reference_values):
+        entries = [reference_values]
+    elif isinstance(reference_values, (Sequence, np.ndarray)):
+        entries = list(reference_values)
+    else:
+        raise TypeError("reference_values must be a number, a dictionary, or a sequence of these")
+
+    def finite_number(value: Any, name: str) -> float:
+        if isinstance(value, (str, bytes, bool, np.bool_)):
+            raise TypeError(f"{name} must be a finite number")
+        array = np.asarray(value)
+        if array.ndim != 0:
+            raise TypeError(f"{name} must be a finite number")
+        try:
+            result = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise TypeError(f"{name} must be a finite number") from exc
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must be finite")
+        return result
+
+    allowed = {
+        "value",
+        "error",
+        "unit",
+        "label",
+        "color",
+        "band_color",
+        "linestyle",
+        "linewidth",
+        "alpha",
+        "line_alpha",
+    }
+    prepared = []
+    for index, entry in enumerate(entries):
+        where = f"reference_values[{index}]"
+        spec = dict(entry) if isinstance(entry, Mapping) else {"value": entry}
+        unknown = set(spec) - allowed
+        if unknown:
+            raise ValueError(f"{where} has unsupported keys: {sorted(map(str, unknown))}")
+        if "value" not in spec:
+            raise ValueError(f"{where} requires a 'value' key")
+        input_unit = spec.get("unit", reference_time_unit)
+        if not isinstance(input_unit, str):
+            raise TypeError(f"{where} unit must be a time-unit string")
+        input_factor, _ = _plot_scale(input_unit)
+        factor = display_factor / input_factor
+        value = finite_number(spec["value"], f"{where} value") * factor
+        if not math.isfinite(value):
+            raise ValueError(f"{where} value overflows after time-unit conversion")
+        if yscale == "log" and value <= 0:
+            raise ValueError(f"{where} value must be > 0 on a logarithmic y axis")
+
+        lower = upper = None
+        error = spec.get("error")
+        if error is not None:
+            if isinstance(error, (str, bytes, Mapping)):
+                raise TypeError(
+                    f"{where} error must be a nonnegative number or (lower, upper) pair"
+                )
+            error_array = np.asarray(error)
+            if error_array.ndim == 0:
+                lo_error = hi_error = finite_number(error, f"{where} error")
+            elif error_array.ndim == 1 and error_array.size == 2:
+                lo_error = finite_number(error_array[0], f"{where} lower error")
+                hi_error = finite_number(error_array[1], f"{where} upper error")
+            else:
+                raise ValueError(
+                    f"{where} error must be a nonnegative number or (lower, upper) pair"
+                )
+            if lo_error < 0 or hi_error < 0:
+                raise ValueError(f"{where} errors must be nonnegative magnitudes")
+            lower = value - lo_error * factor
+            upper = value + hi_error * factor
+            if not math.isfinite(lower) or not math.isfinite(upper):
+                raise ValueError(f"{where} band bounds overflow after time-unit conversion")
+
+        label = spec.get("label")
+        if label is not None and not isinstance(label, str):
+            raise TypeError(f"{where} label must be a string or None")
+        color = spec.get("color", "0.4")
+        if color is None:
+            color = "0.4"
+        band_color = spec.get("band_color")
+        if band_color is None:
+            band_color = color
+        # Matplotlib validation also accepts RGB(A) tuples and custom dash tuples.
+        try:
+            to_rgba(color)
+            to_rgba(band_color)
+            Line2D([], [], linestyle=spec.get("linestyle", "--"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{where} has an invalid color, band_color, or linestyle: {exc}"
+            ) from exc
+        line_width = finite_number(spec.get("linewidth", 1.5), f"{where} linewidth")
+        band_alpha = finite_number(spec.get("alpha", 0.15), f"{where} alpha")
+        line_alpha = finite_number(spec.get("line_alpha", 1.0), f"{where} line_alpha")
+        if line_width < 0:
+            raise ValueError(f"{where} linewidth must be nonnegative")
+        if not (0 <= band_alpha <= 1 and 0 <= line_alpha <= 1):
+            raise ValueError(f"{where} alpha and line_alpha must be between 0 and 1")
+        prepared.append(
+            {
+                "value": value,
+                "lower": lower,
+                "upper": upper,
+                "color": color,
+                "band_color": band_color,
+                "linestyle": spec.get("linestyle", "--"),
+                "linewidth": line_width,
+                "alpha": band_alpha,
+                "line_alpha": line_alpha,
+                "label": label,
+            }
+        )
+    return prepared
+
+
+def _draw_time_reference_lines(
+    ax: Any, references: Sequence[Mapping[str, Any]], *, yscale: str
+) -> None:
+    """Draw full-width lines and bands; omit impossible log bands with a warning."""
+    omitted = []
+    for index, spec in enumerate(references):
+        lower, upper = spec["lower"], spec["upper"]
+        if lower is not None and upper is not None and upper > lower:
+            if yscale == "log" and lower <= 0:
+                omitted.append(spec["label"] or f"reference {index + 1}")
+            else:
+                ax.axhspan(
+                    lower,
+                    upper,
+                    facecolor=spec["band_color"],
+                    alpha=spec["alpha"],
+                    edgecolor="none",
+                    linewidth=0,
+                    label="_nolegend_",
+                    zorder=0.5,
+                )
+        ax.axhline(
+            spec["value"],
+            color=spec["color"],
+            linestyle=spec["linestyle"],
+            linewidth=spec["linewidth"],
+            alpha=spec["line_alpha"],
+            label=spec["label"] if spec["label"] is not None else "_nolegend_",
+            zorder=2.0,
+        )
+    if omitted:
+        warnings.warn(
+            "Reference error bands reaching nonpositive times were omitted on the log axis; "
+            "reference lines remain visible. Use yscale='linear' to display full bands. "
+            + "; ".join(omitted),
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
 def plot_reconfiguration_times(
     fits: Any,
     *,
+    components: Union[str, Sequence[str]] = "overall",
     uncertainty: Optional[str] = "sem",
     show_chains: bool = False,
     min_chains: int = 1,
@@ -2684,6 +2969,16 @@ def plot_reconfiguration_times(
     ylim: Optional[tuple[float, float]] = None,
     labels: Optional[Union[Mapping[str, str], Sequence[str]]] = None,
     colors: Optional[Union[Mapping[str, Any], Sequence[Any], str]] = None,
+    component_colors: Optional[Mapping[str, Any]] = None,
+    component_labels: Optional[Mapping[str, str]] = None,
+    component_linestyles: Optional[Mapping[str, Any]] = None,
+    linewidth: float = 1.0,
+    markersize: float = 3.0,
+    capsize: float = 2.0,
+    reference_values: Optional[
+        Union[float, Mapping[str, Any], Sequence[Union[float, Mapping[str, Any]]]]
+    ] = None,
+    reference_time_unit: str = "ns",
     legend_kwargs: Optional[Mapping[str, Any]] = None,
     xlabel: Optional[str] = None,
     ylabel: Optional[str] = None,
@@ -2694,31 +2989,89 @@ def plot_reconfiguration_times(
     save_path: Any = None,
     save_dpi: float = 300,
 ) -> tuple[Any, Any]:
-    """Plot per-residue mean fitted times, with chain SD or SEM error bars.
+    """Plot per-residue effective, fast, and/or slow reconfiguration times.
 
-    Uses PDB residue numbers, not 0-based row indices. Missing/unresolved fits
-    remain gaps. min_chains can require a fixed minimum coverage per residue;
-    inspect residue_n_chains when comparing profiles. For one chain the point
-    is plotted with no error bar, because chain variation is not estimable.
-    xlabel/ylabel optionally override the default axis labels.
-    Aggregate results plot per-residue aggregate parameters. uncertainty='sem'
-    means chain-bootstrap SE in that mode; 'std' and show_chains=True are not
-    defined because individual-chain fitted times are not calculated.
-    Multiple result mappings or ordered sequences are accepted; colors/labels
-    can be keyed mappings or sequences in the corresponding dataset order.
+    ``components`` is 'overall' (default), 'fast', 'slow', 'all', or a sequence,
+    e.g. ('overall', 'fast', 'slow'). 'effective' aliases 'overall'. Overall is
+    the integrated normalized fitted decay AT EACH RESIDUE, not the scalar
+    overall result spanning all residues. For a double exponential it equals
+    f*tau_fast + (1-f)*tau_slow. Fast/slow profiles use double-exponential fits
+    only; single/stretched, missing, or rejected sites are gaps, not zeroes.
+
+    With aggregate fits, estimates come from each residue's chain-averaged
+    correlation fit; uncertainty='sem' uses that parameter's chain-bootstrap
+    standard error. Without bootstrap, with fewer than two contributors, or
+    with a numerical bootstrap failure, the point is shown without an error
+    bar. 'std' and show_chains=True are undefined for aggregate results.
+    Individual fits use per-residue means, SD or SEM across accepted chains.
+    min_chains applies separately to each component, so single-exponential
+    fits do not count toward a fast/slow component's coverage.
+
+    The x axis retains PDB residue numbers, sorted numerically. Excluding
+    termini does NOT renumber the remaining residues. yscale may be 'linear'
+    or 'log' (default). Time units are ns by default; this changes display units
+    only, without applying another kinetic correction. Missing points remain
+    gaps. On a log axis, symmetric error bars reaching nonpositive times are
+    omitted with a warning; their estimates remain visible. Use a linear axis
+    to see those full error bars; uncertainty=None disables errors entirely.
+
+    One result, a named mapping, or an ordered sequence can be supplied.
+    colors/labels retain their dataset-level meanings. For a single dataset,
+    components receive different automatic colors unless colors is supplied.
+    Multiple datasets use one color per dataset and line style per component:
+    overall solid, fast dashed, slow dotted. component_colors, component_labels,
+    and component_linestyles are mappings keyed by component name and override
+    those defaults. Example: component_colors={'fast': 'blue', 'slow': 'red'}.
+    For a single overall profile, legend labels retain the previous behavior.
+    Plotting never recalculates correlations, refits curves, or resamples chains.
+
+    ``reference_values`` adds one or more full-width horizontal time references.
+    Supply a number, a dictionary, or a sequence of numbers/dictionaries. Each
+    dictionary requires ``value`` and accepts ``error`` (a nonnegative symmetric
+    magnitude, or a (lower, upper) pair of nonnegative magnitudes), ``label``,
+    ``color`` (default '0.4'), ``linestyle`` (default '--'), ``linewidth``
+    (default 1.5), ``band_color`` (defaults to the line color), ``alpha`` (band
+    opacity, default 0.15), and ``line_alpha`` (default 1.0). References without
+    a label do not enter the legend; bands never duplicate line legend entries.
+
+    Reference values AND errors are numeric times in ``reference_time_unit``
+    (default 'ns'), independently of the display ``time_unit``. A dictionary's
+    ``unit`` overrides the input unit for that reference. Values/bounds are
+    converted to the displayed units, with NO additional kinetic scaling.
+    For example, {'value': 100, 'error': 20} is 100 +/- 20 ns, plotted at
+    0.1 +/- 0.02 with time_unit='us'. To specify input in displayed units,
+    explicitly set reference_time_unit=time_unit. Like other plotting limits,
+    ylim still uses displayed units. Reference values must be positive on log
+    axes. A band whose lower bound is nonpositive is omitted with a warning,
+    but its line remains. Bands are drawn behind the profile curves.
     """
+    selected_components = _time_profile_components(components)
+    component_color_map = _time_profile_component_style(component_colors, "component_colors")
+    component_label_map = _time_profile_component_style(component_labels, "component_labels")
+    component_style_map = _time_profile_component_style(
+        component_linestyles, "component_linestyles"
+    )
     if uncertainty not in {None, "sem", "std"}:
         raise ValueError("uncertainty must be sem, std, or None")
+    if yscale not in {"linear", "log"}:
+        raise ValueError("yscale must be 'linear' or 'log'")
+    for name, value in (("show_chains", show_chains), ("legend", legend)):
+        if not isinstance(value, (bool, np.bool_)):
+            raise TypeError(f"{name} must be a boolean")
+    for name, value in (("linewidth", linewidth), ("markersize", markersize), ("capsize", capsize)):
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and nonnegative")
     min_chains = _integer(min_chains, "min_chains", 1)
     factor, unit = _plot_scale(time_unit)
-    if ax is None:
-        fig, ax = plt.subplots(figsize=figsize)
-    else:
-        fig = ax.figure
-    plotted = False
-    for dataset_index, (key, fit) in enumerate(
-        _plot_items(fits, (ReconfigurationTimeResult, ReconfigurationAggregateTimeResult))
-    ):
+    references = _prepare_time_reference_lines(
+        reference_values,
+        reference_time_unit=reference_time_unit,
+        time_unit=time_unit,
+        yscale=yscale,
+    )
+    items = _plot_items(fits, (ReconfigurationTimeResult, ReconfigurationAggregateTimeResult))
+    prepared = []
+    for dataset_index, (key, fit) in enumerate(items):
         if fit.residue_numbers is None:
             raise ValueError("residue profiles require torsion fits, not scalar/Rg fits")
         aggregate_mode = isinstance(fit, ReconfigurationAggregateTimeResult)
@@ -2732,53 +3085,130 @@ def plot_reconfiguration_times(
                 "aggregate profiles provide bootstrap SE, not across-chain SD; "
                 "use uncertainty='sem' or None"
             )
-        # Sort residue numbers for line plots; explicit analysis ordering may differ.
-        order = np.argsort(fit.residue_numbers)
-        x = fit.residue_numbers[order]
-        y = fit.residue_mean_tau_ns[order] * factor
-        y = np.where(fit.residue_n_chains[order] >= min_chains, y, np.nan)
-        good = np.isfinite(y) & ((y > 0) if yscale == "log" else True)
-        if not np.any(good):
-            continue
-        plotted = True
-        label = _plot_style_value(labels, key, dataset_index, key, name="labels")
-        selected_color = _plot_style_value(colors, key, dataset_index, None, name="colors")
-        line_kwargs: dict[str, Any] = {
-            "marker": "o",
-            "markersize": 3,
-            "linewidth": 1.0,
-            "label": label,
-        }
-        if selected_color is not None:
-            line_kwargs["color"] = selected_color
-        line = ax.plot(x, np.where(good, y, np.nan), **line_kwargs)[0]
-        color = line.get_color()
-        if uncertainty is not None:
-            error = (fit.residue_sem_tau_ns if uncertainty == "sem" else fit.residue_std_tau_ns)[
-                order
-            ] * factor
-            keep = good & np.isfinite(error)
+        numbers = np.asarray(fit.residue_numbers)
+        if numbers.ndim != 1 or numbers.size == 0:
+            raise ValueError("residue_numbers must be a nonempty one-dimensional array")
+        order = np.argsort(numbers)
+        x = numbers[order]
+        profiles = []
+        for component in selected_components:
+            values, errors, counts, rows = _residue_time_profile(fit, component, uncertainty)
+            y = values[order] * factor
+            enough = counts[order] >= min_chains
+            good = enough & np.isfinite(y)
             if yscale == "log":
-                if np.any(keep & (y - error <= 0)):
-                    warnings.warn(
-                        "Some error bars extend to nonpositive times and cannot be shown on a log axis; "
-                        "use yscale='linear' to display those uncertainties.",
-                        RuntimeWarning,
-                        stacklevel=2,
+                good &= y > 0
+            profiles.append(
+                (
+                    component,
+                    np.where(good, y, np.nan),
+                    errors[order] * factor,
+                    good,
+                    enough,
+                    None if rows is None else rows[:, order] * factor,
+                )
+            )
+        prepared.append((dataset_index, key, x, profiles))
+    if not any(np.any(profile[3]) for _, _, _, profiles in prepared for profile in profiles):
+        raise ValueError(
+            "no accepted residue fits for the requested components meet min_chains; "
+            "fast/slow require double-exponential fits"
+        )
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+    style_defaults = {"overall": "-", "fast": "--", "slow": ":"}
+    label_defaults = {"overall": "Overall", "fast": "Fast", "slow": "Slow"}
+    plotted_components: set[str] = set()
+    nonpositive_errors: list[str] = []
+    for dataset_index, key, x, profiles in prepared:
+        dataset_label = _plot_style_value(labels, key, dataset_index, key, name="labels")
+        dataset_color = _plot_style_value(colors, key, dataset_index, None, name="colors")
+        for component, y, error, good, enough, rows in profiles:
+            if not np.any(good):
+                continue
+            if selected_components == ("overall",) and not component_label_map:
+                label = dataset_label  # preserve the original overall-only legend
+            else:
+                suffix = component_label_map.get(component, label_defaults[component])
+                label = (
+                    suffix if len(items) == 1 and labels is None else f"{dataset_label}: {suffix}"
+                )
+            selected_color = component_color_map.get(component, dataset_color)
+            linestyle = component_style_map.get(component, style_defaults[component])
+            line_kwargs: dict[str, Any] = {
+                "marker": "o",
+                "markersize": float(markersize),
+                "linewidth": float(linewidth),
+                "linestyle": linestyle,
+                "label": label,
+            }
+            if selected_color is not None:
+                line_kwargs["color"] = selected_color
+            line = ax.plot(x, y, **line_kwargs)[0]
+            color = line.get_color()
+            # Share a color within each dataset only in multi-dataset plots.
+            # Component overrides must not become the dataset's implicit color.
+            if len(items) > 1 and dataset_color is None and component not in component_color_map:
+                dataset_color = color
+            plotted_components.add(component)
+            if uncertainty is not None:
+                keep = good & np.isfinite(error) & (error >= 0)
+                if yscale == "log":
+                    invalid_lower = keep & (y - error <= 0)
+                    if np.any(invalid_lower):
+                        nonpositive_errors.append(
+                            f"{key}/{component} ({np.count_nonzero(invalid_lower)} points)"
+                        )
+                    keep &= y - error > 0
+                if np.any(keep):
+                    ax.errorbar(
+                        x[keep],
+                        y[keep],
+                        yerr=error[keep],
+                        fmt="none",
+                        capsize=float(capsize),
+                        color=color,
                     )
-                keep &= y - error > 0
-            ax.errorbar(x[keep], y[keep], yerr=error[keep], fmt="none", capsize=2, color=color)
-        if show_chains:
-            for row in fit.tau_per_chain_residue_ns[:, order]:
-                ax.plot(x, row * factor, alpha=0.25, linewidth=0.6, color=color)
-    if not plotted:
-        raise ValueError("no accepted residue fits meet min_chains; inspect fit flags")
+            if show_chains and rows is not None:
+                for row in rows:
+                    chain_good = enough & np.isfinite(row)
+                    if yscale == "log":
+                        chain_good &= row > 0
+                    ax.plot(
+                        x,
+                        np.where(chain_good, row, np.nan),
+                        alpha=0.25,
+                        linewidth=0.6,
+                        color=color,
+                        linestyle=linestyle,
+                    )
+    if nonpositive_errors:
+        warnings.warn(
+            "Symmetric error bars reaching nonpositive times were omitted on the log axis; "
+            "estimates remain visible. Use yscale='linear' to display full uncertainties. "
+            + "; ".join(nonpositive_errors),
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    omitted = set(selected_components) - plotted_components
+    if omitted:
+        warnings.warn(
+            "No plottable residue estimates for components: "
+            + ", ".join(sorted(omitted))
+            + ". Fast/slow profiles require accepted double-exponential fits.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     ax.set(
         xlabel="PDB residue number" if xlabel is None else xlabel,
         ylabel=f"reconfiguration time ({unit})" if ylabel is None else ylabel,
         yscale=yscale,
     )
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    _draw_time_reference_lines(ax, references, yscale=yscale)
     if title is not None:
         ax.set_title(title)
     if xlim is not None:
