@@ -14,7 +14,9 @@ probability, a first-passage time, or an exhaustive conformational mixing time.
 
 By default each chain/residue is fitted separately. With aggregation="aggregate",
 normalized correlations are averaged first and whole-chain bootstrap errors are
-available. Individual-mode residue times are averaged within each
+available. With average_over_sets=True, chains are averaged within runs and
+independent simulation runs receive equal weights; complete runs are bootstrapped.
+Individual-mode residue times are averaged within each
 chain, then chain means are averaged; residues are never counted as independent
 replicates for the overall SEM. Chain SEM assumes independent chains and may be
 optimistic for interacting chains in a single condensate.
@@ -42,6 +44,7 @@ __all__ = [
     "ReconfigurationDecayFit",
     "ReconfigurationTimeResult",
     "ReconfigurationAggregateTimeResult",
+    "ReconfigurationSetAggregateTimeResult",
     "calculate_reconfiguration_correlations",
     "fit_reconfiguration_times",
     "plot_reconfiguration_correlations",
@@ -1643,6 +1646,443 @@ class ReconfigurationAggregateTimeResult:
         return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class ReconfigurationSetAggregateTimeResult(ReconfigurationAggregateTimeResult):
+    """Fit equal-weight simulation means; bootstrap complete simulation sets.
+
+    Physical chains are averaged within each simulation before sets are averaged.
+    ``set_mean_correlations`` stores those simulation means; its first axis is
+    SETS, not physical chains. Inherited ``chain_labels``, ``overall_site_mask``,
+    ``residue_site_mask``, and ``bootstrap_chain_indices`` describe that internal
+    axis. Prefer set_labels, overall_set_site_mask, residue_set_site_mask and
+    bootstrap_set_indices when inspecting a multi-set result. Physical chain
+    labels and fixed coverage masks are retained separately in *_by_set fields.
+
+    n_chains/residue_n_chains count physical contributors, whereas n_sets and
+    residue_n_sets count the independent units used for uncertainty. Bootstrap
+    replicates resample sets only (no additional within-set chain bootstrap).
+    Point estimates and plotting use equal set weights regardless of chain count.
+    SEs/percentile intervals are conditional on the selected sets, chains,
+    residue coverage, model and fitting window. They do not measure finite-record
+    bias, model uncertainty or dependence between supposedly independent runs.
+    """
+
+    set_mean_correlations: Optional[ReconfigurationCorrelationResult] = None
+    overall_correlations_by_set: Optional[np.ndarray] = None
+    chain_labels_by_set: Optional[dict[str, tuple[str, ...]]] = None
+    chain_site_masks_by_set: Optional[dict[str, np.ndarray]] = None
+    overall_chain_site_masks_by_set: Optional[dict[str, np.ndarray]] = None
+    source_metadata_by_set: Optional[dict[str, Any]] = None
+    coverage_tmax_ns: float = float("nan")
+    aggregation: str = "aggregate_sets"
+
+    @property
+    def bootstrap_unit(self) -> str:
+        return "set"
+
+    @property
+    def set_labels(self) -> tuple[str, ...]:
+        return self.chain_labels
+
+    @property
+    def n_sets(self) -> int:
+        return int(np.count_nonzero(np.any(self.overall_site_mask, axis=1)))
+
+    @property
+    def n_total_sets(self) -> int:
+        return len(self.set_labels)
+
+    @property
+    def contributing_set_labels(self) -> tuple[str, ...]:
+        return tuple(
+            label
+            for label, used in zip(self.set_labels, np.any(self.overall_site_mask, axis=1))
+            if used
+        )
+
+    @property
+    def residue_n_sets(self) -> np.ndarray:
+        return self.residue_site_mask.sum(axis=0)
+
+    @property
+    def overall_set_site_mask(self) -> np.ndarray:
+        return self.overall_site_mask
+
+    @property
+    def residue_set_site_mask(self) -> np.ndarray:
+        return self.residue_site_mask
+
+    @property
+    def bootstrap_set_indices(self) -> np.ndarray:
+        return self.bootstrap_chain_indices
+
+    @property
+    def n_chains(self) -> int:
+        return sum(
+            int(np.any(mask, axis=1).sum())
+            for mask in (self.overall_chain_site_masks_by_set or {}).values()
+        )
+
+    @property
+    def n_total_chains(self) -> int:
+        return sum(len(labels) for labels in (self.chain_labels_by_set or {}).values())
+
+    @property
+    def contributing_chain_labels(self) -> tuple[str, ...]:
+        return tuple(
+            f"{name}/{label}"
+            for name in self.set_labels
+            for label, used in zip(
+                self.chain_labels_by_set[name],
+                np.any(self.overall_chain_site_masks_by_set[name], axis=1),
+            )
+            if used
+        )
+
+    @property
+    def residue_n_chains(self) -> np.ndarray:
+        count = np.zeros(len(self.residue_fits), dtype=np.int64)
+        for si, name in enumerate(self.set_labels):
+            count += self.chain_site_masks_by_set[name].sum(axis=0) * self.residue_site_mask[si]
+        return count
+
+    def _bootstrap_source(self, resnum: Optional[int]) -> tuple[Any, int, Any]:
+        if resnum is None:
+            return self.bootstrap_fits, self.n_sets, self.fit
+        if self.residue_numbers is None:
+            raise ValueError("resnum applies only to residue-resolved torsion fits")
+        match = np.flatnonzero(self.residue_numbers == _integer(resnum, "resnum"))
+        if match.size != 1:
+            raise ValueError(f"residue {resnum} is not present")
+        index = int(match[0])
+        return (
+            self.residue_bootstrap_fits[index],
+            int(self.residue_n_sets[index]),
+            self.residue_fits[index],
+        )
+
+    def report(self, *, max_rows: Optional[int] = None) -> str:
+        if max_rows is not None:
+            max_rows = _integer(max_rows, "max_rows", 1)
+        lines = [
+            f"Dataset: {self.dataset_label} | aggregation=aggregate_sets | "
+            f"contributors={self.n_sets}/{self.n_total_sets} simulation sets",
+            f"Physical chains used overall: {self.n_chains}/{self.n_total_chains}",
+            "Point estimates fit equal-weight set means; errors are set-bootstrap SEs.",
+            "Sets: " + ", ".join(self.set_labels),
+            f"Bootstrap: {self.n_bootstrap_successful}/{len(self.bootstrap_fits)} "
+            f"numerically successful; {self.n_bootstrap_flagged} flagged; "
+            f"{self.n_bootstrap_requested} requested.",
+            "Complete sets are resampled; chains within a set are not independent bootstrap units.",
+            "Model/window, chain selections and coverage are fixed; independent runs are assumed.",
+        ]
+        if self.n_sets < 2:
+            lines.append("Only one simulation set: set-bootstrap errors are undefined.")
+        elif not self.bootstrap_fits:
+            lines.append("No bootstrap performed: use n_bootstrap>=2 for standard errors.")
+        if self.n_bootstrap_successful < len(self.bootstrap_fits):
+            lines.append("Numerical failures retained: affected SE/CI are NaN.")
+
+        def append_fit(
+            title: str, item: ReconfigurationDecayFit, resnum: Optional[int] = None
+        ) -> None:
+            lines.append(
+                f"{title}: model={item.model}; status={item.status}; accepted={item.accepted}"
+            )
+            params = ["tau_ns", "amplitude"]
+            if item.model == "double":
+                params += ["tau_fast_ns", "tau_slow_ns", "fast_fraction"]
+            elif item.model == "stretched":
+                params += ["tau_scale_ns", "stretch_beta"]
+            for parameter in params:
+                low, high = self.confidence_interval(parameter, resnum=resnum)
+                lines.append(
+                    f"  {parameter}={float(getattr(item, parameter)):.6g}; "
+                    f"set-bootstrap SE={self.standard_error(parameter, resnum=resnum):.6g}; "
+                    f"{100*self.confidence_level:g}% percentile CI=[{low:.6g}, {high:.6g}]"
+                )
+            lines.append(
+                f"  window={item.fit_tmin_ns:g}..{item.fit_tmax_ns:g} ns; "
+                f"R2={item.r_squared:.5g}; RMSE={item.rmse:.5g}; "
+                f"tail={item.tail_fraction:.3g}; sensitivity={item.window_sensitivity:.3g}"
+            )
+            lines.append("  flags=" + (", ".join(item.flags) or "none"))
+
+        append_fit("Overall", self.fit)
+        if self.residue_numbers is not None:
+            for i, (number, item) in enumerate(zip(self.residue_numbers, self.residue_fits)):
+                if max_rows is not None and i >= max_rows:
+                    lines.append(f"... {len(self.residue_fits)-i} more residue fits")
+                    break
+                append_fit(
+                    f"Residue {number} (sets={self.residue_n_sets[i]}, "
+                    f"chains={self.residue_n_chains[i]})",
+                    item,
+                    int(number),
+                )
+        return "\n".join(lines)
+
+
+def _prepare_simulation_means(
+    correlations: Mapping[str, ReconfigurationCorrelationResult],
+    *,
+    fit_tmax: Any,
+    residue_averaging: str,
+    warn: bool,
+) -> dict[str, Any]:
+    """Build fixed equal-chain set means without fitting or concatenating time.
+
+    Residue numbers are aligned by value, not row position. Profiles require
+    some eligible chains in EVERY supplied set. Common overall averaging uses
+    residues eligible in every selected physical chain of every set. Available
+    overall averaging permits different residue coverage within chains, but only
+    at positions represented by every set. Metadata records the exact masks.
+    Lag arrays must have an identical common prefix; no interpolation is used.
+    """
+    if not correlations or not all(
+        isinstance(v, ReconfigurationCorrelationResult) for v in correlations.values()
+    ):
+        raise TypeError("average_over_sets requires a nonempty mapping of correlation results")
+    if residue_averaging not in {"common", "available"}:
+        raise ValueError("residue_averaging must be 'common' or 'available'")
+    labels = tuple(correlations)
+    if any(not isinstance(k, str) or not k.strip() for k in labels):
+        raise TypeError("simulation-set keys must be nonempty strings")
+    items = list(correlations.values())
+    first = items[0]
+    n_lags = min(len(item.lag_time_ns) for item in items)
+    if n_lags < 2:
+        raise ValueError("simulation sets must share at least two saved lag times")
+    time = np.asarray(first.lag_time_ns[:n_lags], dtype=float).copy()
+    for name, item in zip(labels, items):
+        ti = np.asarray(item.lag_time_ns, dtype=float)
+        if ti.ndim != 1 or not np.all(np.isfinite(ti)) or ti[0] != 0 or np.any(np.diff(ti) <= 0):
+            raise ValueError(f"{name}: lag times must start at zero and increase strictly")
+        if not np.allclose(ti[:n_lags], time, rtol=1e-10, atol=1e-12):
+            raise ValueError(
+                "simulation lag grids differ; recalculate with matching dt, "
+                "kinetic_scale and lag_stride (no implicit interpolation)"
+            )
+        for field in ("kind", "observables", "torsion_weighting", "require_all_angles"):
+            if getattr(item, field) != getattr(first, field):
+                raise ValueError(f"{name}: incompatible {field} across simulation sets")
+        for field in ("dt_ns", "kinetic_scale"):
+            value = float(getattr(item, field))
+            if (
+                not np.isfinite(value)
+                or value <= 0
+                or not math.isclose(value, float(getattr(first, field)), rel_tol=1e-10, abs_tol=0)
+            ):
+                raise ValueError(f"{name}: incompatible {field} across simulation sets")
+        if item.n_chains < 1 or len(set(item.chain_labels)) != item.n_chains:
+            raise ValueError(f"{name}: no chains or duplicate physical chain labels")
+    end = float(time[-1]) if fit_tmax is None else _time(fit_tmax, "fit_tmax")
+    if not 0 < end <= time[-1] + 1e-10 * max(1, time[-1]):
+        raise ValueError(f"fit_tmax must be within the common saved lag range (0..{time[-1]:g} ns)")
+    if warn and any(len(item.lag_time_ns) != n_lags for item in items):
+        warnings.warn(
+            f"Simulation-set averaging uses the common lag prefix through {time[-1]:g} ns; "
+            "longer individual curves are truncated, not interpolated.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    torsions = first.kind == "torsions"
+    if torsions:
+        local_numbers = []
+        for name, item in zip(labels, items):
+            raw = np.asarray(item.residue_numbers)
+            if raw.ndim != 1 or raw.size == 0:
+                raise ValueError(f"{name}: invalid residue_numbers")
+            numbers = np.asarray([_integer(x, "residue number") for x in raw], dtype=np.int64)
+            if len(set(numbers)) != len(numbers):
+                raise ValueError(f"{name}: duplicate residue numbers")
+            local_numbers.append(numbers)
+        numbers = np.unique(np.concatenate(local_numbers))
+    else:
+        if any(item.residue_numbers is not None for item in items):
+            raise ValueError("scalar results must have residue_numbers=None")
+        numbers = None
+        local_numbers = [np.array([0]) for _ in items]
+    n_sites = len(numbers) if torsions else 1
+    n_sets = len(items)
+    means = np.full((n_sets, n_sites, n_lags), np.nan)
+    pair_counts = np.zeros(means.shape, dtype=np.int64)
+    supports = np.zeros((n_sets, n_sites), dtype=float)
+    eligible_by_set = {}
+    source_labels = {}
+    source_metadata = {}
+    aligned_data = {}
+    common_physical = np.ones(n_sites, dtype=bool)
+    for si, (name, item, rn) in enumerate(zip(labels, items, local_numbers)):
+        data = np.asarray(item.correlation)
+        expected = (item.n_chains, len(rn), len(item.lag_time_ns))
+        if data.shape != expected or np.shape(item.pair_counts) != expected:
+            raise ValueError(f"{name}: correlation/pair_counts shape must be {expected}")
+        positions = np.searchsorted(numbers, rn) if torsions else np.array([0])
+        if len(rn) == n_sites and np.array_equal(positions, np.arange(n_sites)):
+            aligned = data[:, :, :n_lags]  # read-only use of the original arrays
+        else:
+            aligned = np.full(
+                (item.n_chains, n_sites, n_lags),
+                np.nan,
+                dtype=np.result_type(data.dtype, np.float32),
+            )
+            aligned[:, positions, :] = data[:, :, :n_lags]
+        # Fixed membership throughout 0..requested fitting endpoint.
+        eligible = np.all(np.isfinite(aligned[:, :, time <= end]), axis=2)
+        if not np.any(eligible):
+            raise ValueError(
+                f"{name}: no finite chain/site correlation through {end:g} ns; "
+                "a simulation set is never silently dropped"
+            )
+        common_physical &= np.all(eligible, axis=0)
+        raw_support = (
+            np.full(data.shape[:2], item.max_contiguous_time_ns)
+            if item.contiguous_time_per_site_ns is None
+            else np.asarray(item.contiguous_time_per_site_ns, dtype=float)
+        )
+        if raw_support.shape != data.shape[:2]:
+            raise ValueError(f"{name}: invalid per-site observation support shape")
+        support = np.zeros(eligible.shape)
+        support[:, positions] = raw_support
+        if not np.all(np.isfinite(support[eligible])) or np.any(support[eligible] <= 0):
+            raise ValueError(f"{name}: invalid observation duration for an eligible site")
+        lookup = {int(p): i for i, p in enumerate(positions)}
+        for ri in range(n_sites):
+            used = eligible[:, ri]
+            if np.any(used):
+                means[si, ri] = np.mean(aligned[used, ri], axis=0, dtype=np.float64)
+                supports[si, ri] = np.min(support[used, ri])
+                pair_counts[si, ri] = np.sum(item.pair_counts[used, lookup[ri], :n_lags], axis=0)
+        eligible_by_set[name] = eligible
+        aligned_data[name] = aligned
+        source_labels[name] = tuple(item.chain_labels)
+        source_metadata[name] = {
+            "frame_start": item.frame_start,
+            "frame_stop": item.frame_stop,
+            "dt_ns": item.dt_ns,
+            "n_frames": item.n_frames,
+            "time_origin_ns": item.time_origin_ns,
+            "kinetic_scale": item.kinetic_scale,
+            "max_contiguous_time_ns": item.max_contiguous_time_ns,
+        }
+    # All supplied sets contribute at each reported position. Missing-set sites
+    # stay as gaps; they are not silently averaged over a smaller set pool.
+    common_sets = np.all(np.stack([np.any(m, axis=0) for m in eligible_by_set.values()]), axis=0)
+    if not np.any(common_sets):
+        raise ValueError("no residue/site has finite contributors in every simulation set")
+    means[:, ~common_sets] = np.nan
+    pair_counts[:, ~common_sets] = 0
+    supports[:, ~common_sets] = 0
+    chosen_sites = common_physical if torsions and residue_averaging == "common" else common_sets
+    if not np.any(chosen_sites):
+        raise ValueError(
+            "no common residue is finite in every selected chain of every set; "
+            "restrict the residue/window selection or explicitly use "
+            "residue_averaging='available'"
+        )
+    overall_masks = {}
+    overall_rows = []
+    for name in labels:
+        mask = eligible_by_set[name] & chosen_sites[None, :]
+        overall_masks[name] = mask
+        rows = _aggregate_correlation_rows(aligned_data[name], mask)
+        active = np.any(mask, axis=1)
+        if not np.any(active):
+            raise ValueError(f"{name}: no overall contributors; refusing to drop this set")
+        overall_rows.append(np.mean(rows[active], axis=0))
+    overall_mask = np.broadcast_to(chosen_sites, (n_sets, n_sites)).copy()
+    status = np.where(common_sets[None, :, None], "set_mean", "missing")
+    features_shape = (n_sets, n_sites, len(first.observables))
+    synthetic = ReconfigurationCorrelationResult(
+        lag_time_ns=time,
+        correlation=means,
+        pair_counts=pair_counts,
+        chain_labels=labels,
+        residue_numbers=numbers,
+        observables=first.observables,
+        kind=first.kind,
+        component_variance=np.full(features_shape, np.nan),
+        circular_plateau=np.full(features_shape, np.nan),
+        component_status=np.broadcast_to(status, features_shape).copy(),
+        dt_ns=first.dt_ns,
+        kinetic_scale=first.kinetic_scale,
+        n_frames=min(item.n_frames for item in items),
+        frame_start=0,
+        frame_stop=min(item.n_frames for item in items),
+        time_origin_ns=0.0,
+        max_contiguous_time_ns=float(np.min(supports[:, chosen_sites])),
+        contiguous_time_per_site_ns=supports,
+        torsion_weighting=first.torsion_weighting,
+        require_all_angles=first.require_all_angles,
+        min_pairs=max(item.min_pairs for item in items),
+        dataset_label="all_sets",
+    )
+    if warn and (
+        not np.all(common_sets)
+        or not np.all(chosen_sites)
+        or any(not np.all(m[:, common_sets]) for m in eligible_by_set.values())
+    ):
+        warnings.warn(
+            "Set aggregation uses fixed finite-data contributors. Profiles require "
+            "coverage in every set; the overall residue selection follows residue_averaging. "
+            "Inspect summary_residue_numbers and chain_site_masks_by_set.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    return dict(
+        correlations=synthetic,
+        overall_rows=np.stack(overall_rows),
+        overall_mask=overall_mask,
+        chain_labels_by_set=source_labels,
+        chain_site_masks_by_set=eligible_by_set,
+        overall_chain_site_masks_by_set=overall_masks,
+        source_metadata_by_set=source_metadata,
+        coverage_tmax_ns=end,
+    )
+
+
+def _set_aggregate_for_plot(raw: Any, fit: ReconfigurationSetAggregateTimeResult) -> Any:
+    """Use saved set means; optionally verify supplied source correlations."""
+    if isinstance(raw, Mapping):
+        if set(raw) != set(fit.set_labels):
+            raise ValueError("source simulation keys differ from those in the combined fit")
+        prepared = _prepare_simulation_means(
+            {key: raw[key] for key in fit.set_labels},
+            fit_tmax=fit.coverage_tmax_ns,
+            residue_averaging=fit.residue_averaging,
+            warn=False,
+        )
+        check = prepared["correlations"]
+        saved = fit.set_mean_correlations
+        if (
+            check.correlation.shape != saved.correlation.shape
+            or not np.array_equal(check.residue_numbers, saved.residue_numbers)
+            or not np.array_equal(check.lag_time_ns, saved.lag_time_ns)
+            or not np.allclose(check.correlation, saved.correlation, equal_nan=True)
+            or not np.allclose(
+                prepared["overall_rows"], fit.overall_correlations_by_set, equal_nan=True
+            )
+        ):
+            raise ValueError(
+                "source correlation values differ from those used for the combined fit"
+            )
+        for key in fit.set_labels:
+            if (
+                prepared["source_metadata_by_set"][key] != fit.source_metadata_by_set[key]
+                or prepared["chain_labels_by_set"][key] != fit.chain_labels_by_set[key]
+                or not np.array_equal(
+                    prepared["chain_site_masks_by_set"][key], fit.chain_site_masks_by_set[key]
+                )
+            ):
+                raise ValueError(
+                    "source chain selection or observation window changed since fitting"
+                )
+    elif raw is not fit and raw is not fit.set_mean_correlations:
+        raise TypeError("plot a combined fit directly or supply its original simulation mapping")
+    return fit.set_mean_correlations
+
+
 def _aggregate_correlation_rows(data: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Equal-site means within each chain, with fixed site membership at all lags."""
     rows = np.full((data.shape[0], data.shape[2]), np.nan)
@@ -1674,6 +2114,9 @@ def _fit_aggregate_correlations(
     residue_averaging: str,
     warn: bool,
     report: bool,
+    overall_rows_override: Optional[np.ndarray] = None,
+    overall_mask_override: Optional[np.ndarray] = None,
+    bootstrap_unit: str = "chain",
 ) -> ReconfigurationAggregateTimeResult:
     """Aggregate cached ACFs before fitting; bootstrap complete chain curves."""
     time = np.asarray(correlations.lag_time_ns, dtype=float)
@@ -1685,7 +2128,11 @@ def _fit_aggregate_correlations(
     coverage = time <= fit_tmax
     eligible = np.all(np.isfinite(data[:, :, coverage]), axis=2)
     eligible &= np.isfinite(data[:, :, 0])
-    if correlations.kind == "torsions" and residue_averaging == "common":
+    if overall_mask_override is not None:
+        overall_mask = np.asarray(overall_mask_override, dtype=bool)
+        if overall_mask.shape != eligible.shape or np.any(overall_mask & ~eligible):
+            raise ValueError("overall mask must select eligible contributors")
+    elif correlations.kind == "torsions" and residue_averaging == "common":
         common = np.all(eligible, axis=0)
         if not np.any(common):
             raise ValueError(
@@ -1708,7 +2155,13 @@ def _fit_aggregate_correlations(
             RuntimeWarning,
             stacklevel=3,
         )
-    rows = _aggregate_correlation_rows(data, overall_mask)
+    rows = (
+        _aggregate_correlation_rows(data, overall_mask)
+        if overall_rows_override is None
+        else np.asarray(overall_rows_override, dtype=float)
+    )
+    if rows.shape != (n_chains, len(time)) or not np.all(np.isfinite(rows[active][:, coverage])):
+        raise ValueError("overall correlation rows lack fixed finite fitting-window support")
     mean = _fixed_chain_mean(rows, active)
     site_means = np.full((n_sites, len(time)), np.nan)
     for ri in range(n_sites):
@@ -1821,7 +2274,7 @@ def _fit_aggregate_correlations(
             site_boot[0] = main_boot
     elif n_bootstrap and warn:
         warnings.warn(
-            "Chain-bootstrap uncertainty is undefined with one contributing chain; "
+            f"{bootstrap_unit.capitalize()}-bootstrap uncertainty is undefined with one contributing {bootstrap_unit}; "
             "the aggregate fit is returned with NaN SE/CI.",
             RuntimeWarning,
             stacklevel=3,
@@ -1858,7 +2311,8 @@ def _fit_aggregate_correlations(
         failed = len(main_boot) - result.n_bootstrap_successful
         profile_failed = sum(
             not item.optimizer_success or not np.isfinite(item.tau_ns)
-            for items in site_boot
+            for ri, items in enumerate(site_boot)
+            if bootstrap_unit != "set" or np.any(eligible[:, ri])
             for item in items
         )
         if failed or (correlations.kind == "torsions" and profile_failed):
@@ -1913,8 +2367,37 @@ def fit_reconfiguration_times(
     n_bootstrap: int = 0,
     random_seed: Optional[int] = 0,
     confidence_level: float = 0.95,
+    average_over_sets: bool = False,
+    group_by: Optional[Mapping[str, str]] = None,
 ) -> Any:
     """Fit per-chain/site decays and summarize their amplitude-normalized areas.
+
+    average_over_sets=False (default) retains independent fitting of mapping
+    entries. With aggregation="aggregate", average_over_sets=True combines a
+    flat mapping {set_label: correlation_result}: average physical chains within
+    each set, weight set means equally, then fit once. n_bootstrap resamples
+    whole simulation sets, NOT physical chains. Model/window stay fixed across
+    bootstrap draws; a single set gives a point estimate but undefined set SE.
+    Independent replicate runs are assumed; do not combine distinct constructs
+    merely because they appear as adjacent dictionary keys.
+
+    A nested {construct: {set: correlation_result}} mapping returns one combined
+    result per construct. Alternatively group_by maps EVERY flat input key to
+    its desired group. Mixed leaf/nested dictionaries are rejected in set mode.
+    No grouping is inferred from key spelling. Both plotting functions accept
+    combined results; plot_reconfiguration_correlations(combined_fit) uses its
+    stored means with shading across sets and an aggregate-fit overlay.
+
+    All sets must have matching observables, angle weighting, input dt,
+    kinetic_scale and lag grids over their common saved prefix. Longer maximum
+    lags are truncated to that prefix; there is no interpolation. Observation
+    durations/windows and chain counts may differ. Residues are aligned by PDB
+    number, not row position. A residue profile requires finite contributors in
+    EVERY set. With residue_averaging="common", the overall curve uses residues
+    finite in every selected physical chain of every set. With "available",
+    chains can use different subsets among the residues present in every set.
+    Contributors are fixed through the requested fitting endpoint, not selected
+    from their fitted times. Exact masks and physical-chain metadata are saved.
 
     aggregation="individual" (default) retains existing per-chain fits.
     aggregation="aggregate" fits the equal-chain mean of normalized ACFs, not
@@ -1994,6 +2477,14 @@ def fit_reconfiguration_times(
     'available' can mix residue coverage and must be used with caution. All
     across-chain SD/SEM values remain NaN for fewer than two contributing chains.
     """
+    if not isinstance(average_over_sets, (bool, np.bool_)):
+        raise TypeError("average_over_sets must be a boolean")
+    if average_over_sets and aggregation != "aggregate":
+        raise ValueError("average_over_sets=True requires aggregation='aggregate'")
+    if group_by is not None and (not average_over_sets or not isinstance(group_by, Mapping)):
+        raise ValueError(
+            "group_by requires average_over_sets=True and a mapping of input keys to groups"
+        )
     if aggregation not in {"individual", "aggregate"}:
         raise ValueError("aggregation must be 'individual' or 'aggregate'")
     n_bootstrap = _integer(n_bootstrap, "n_bootstrap", 0)
@@ -2006,44 +2497,104 @@ def fit_reconfiguration_times(
     confidence_level = float(confidence_level)
     if not np.isfinite(confidence_level) or not 0 < confidence_level < 1:
         raise ValueError("confidence_level must be between 0 and 1")
+    set_prepared = None
     if isinstance(correlations, Mapping):
         if not correlations:
             raise ValueError("correlations mapping is empty")
-        return {
-            key: fit_reconfiguration_times(
-                value,
-                fit_tmin=fit_tmin,
-                fit_tmax=fit_tmax,
-                model=model,
-                fit_amplitude=fit_amplitude,
-                min_fit_points=min_fit_points,
-                min_r_squared=min_r_squared,
-                min_decay_times=min_decay_times,
-                min_observation_times=min_observation_times,
-                include_flagged=include_flagged,
-                residue_averaging=residue_averaging,
-                warn=warn,
-                auto_window=auto_window,
-                auto_cutoff=auto_cutoff,
-                loss=loss,
-                f_scale=f_scale,
-                lag_weighting=lag_weighting,
-                max_fit_points=max_fit_points,
-                check_stability=check_stability,
-                max_window_sensitivity=max_window_sensitivity,
-                max_tail_fraction=max_tail_fraction,
-                model_improvement=model_improvement,
-                min_model_improvement=min_model_improvement,
-                max_fit_rmse=max_fit_rmse,
-                quality_policy=quality_policy,
-                report=report,
-                aggregation=aggregation,
-                n_bootstrap=n_bootstrap,
-                random_seed=random_seed,
-                confidence_level=confidence_level,
-            )
-            for key, value in correlations.items()
-        }
+        child_options = dict(
+            fit_tmin=fit_tmin,
+            fit_tmax=fit_tmax,
+            model=model,
+            fit_amplitude=fit_amplitude,
+            min_fit_points=min_fit_points,
+            min_r_squared=min_r_squared,
+            min_decay_times=min_decay_times,
+            min_observation_times=min_observation_times,
+            include_flagged=include_flagged,
+            residue_averaging=residue_averaging,
+            warn=warn,
+            auto_window=auto_window,
+            auto_cutoff=auto_cutoff,
+            loss=loss,
+            f_scale=f_scale,
+            lag_weighting=lag_weighting,
+            max_fit_points=max_fit_points,
+            check_stability=check_stability,
+            max_window_sensitivity=max_window_sensitivity,
+            max_tail_fraction=max_tail_fraction,
+            model_improvement=model_improvement,
+            min_model_improvement=min_model_improvement,
+            max_fit_rmse=max_fit_rmse,
+            quality_policy=quality_policy,
+            report=False if average_over_sets else report,
+            aggregation=aggregation,
+            n_bootstrap=n_bootstrap,
+            random_seed=random_seed,
+            confidence_level=confidence_level,
+            average_over_sets=average_over_sets,
+        )
+        leaf = [isinstance(v, ReconfigurationCorrelationResult) for v in correlations.values()]
+        if average_over_sets and group_by is not None:
+            if not all(leaf):
+                raise ValueError("group_by is supported for flat simulation-result mappings only")
+            if set(group_by) != set(correlations):
+                raise ValueError("group_by must contain exactly the input simulation keys")
+            groups = {}
+            for key, value in correlations.items():
+                group = group_by[key]
+                if not isinstance(group, str) or not group.strip():
+                    raise ValueError("group names must be nonempty strings")
+                groups.setdefault(group, {})[key] = value
+            out = {}
+            for key, group in groups.items():
+                result = fit_reconfiguration_times(group, **child_options)
+                out[key] = replace(
+                    result,
+                    dataset_label=key,
+                    set_mean_correlations=replace(result.set_mean_correlations, dataset_label=key),
+                )
+                if report:
+                    print(out[key].report())
+            return out
+        if not average_over_sets:
+            return {
+                key: fit_reconfiguration_times(value, **child_options)
+                for key, value in correlations.items()
+            }
+        if not all(leaf):
+            if any(leaf) or not all(isinstance(v, Mapping) for v in correlations.values()):
+                raise ValueError(
+                    "set averaging requires all values to be results or all values "
+                    "to be nested groups; do not mix those levels"
+                )
+            out = {}
+            for key, value in correlations.items():
+                if not isinstance(key, str) or not key.strip():
+                    raise ValueError("group keys must be nonempty strings")
+                result = fit_reconfiguration_times(value, **child_options)
+                out[key] = (
+                    replace(
+                        result,
+                        dataset_label=key,
+                        set_mean_correlations=replace(
+                            result.set_mean_correlations, dataset_label=key
+                        ),
+                    )
+                    if isinstance(result, ReconfigurationSetAggregateTimeResult)
+                    else result
+                )
+                if report and isinstance(out[key], ReconfigurationSetAggregateTimeResult):
+                    print(out[key].report())
+            return out
+        set_prepared = _prepare_simulation_means(
+            correlations,
+            fit_tmax=fit_tmax,
+            residue_averaging=residue_averaging,
+            warn=warn,
+        )
+        correlations = set_prepared["correlations"]
+    elif average_over_sets:
+        raise TypeError("average_over_sets=True requires a mapping of simulation results")
     if not isinstance(correlations, ReconfigurationCorrelationResult):
         raise TypeError("correlations must come from calculate_reconfiguration_correlations")
     aliases = {
@@ -2140,7 +2691,8 @@ def fit_reconfiguration_times(
             max_fit_rmse=max_fit_rmse,
             quality_policy=quality_policy,
         )
-        return _fit_aggregate_correlations(
+        combined = set_prepared is not None
+        result = _fit_aggregate_correlations(
             correlations,
             fit_options=options,
             model=model,
@@ -2152,8 +2704,25 @@ def fit_reconfiguration_times(
             confidence_level=confidence_level,
             residue_averaging=residue_averaging,
             warn=warn,
-            report=report,
+            report=report and not combined,
+            overall_rows_override=set_prepared["overall_rows"] if combined else None,
+            overall_mask_override=set_prepared["overall_mask"] if combined else None,
+            bootstrap_unit="set" if combined else "chain",
         )
+        if combined:
+            result = ReconfigurationSetAggregateTimeResult(
+                **{k: v for k, v in vars(result).items() if k != "aggregation"},
+                set_mean_correlations=correlations,
+                overall_correlations_by_set=set_prepared["overall_rows"],
+                chain_labels_by_set=set_prepared["chain_labels_by_set"],
+                chain_site_masks_by_set=set_prepared["chain_site_masks_by_set"],
+                overall_chain_site_masks_by_set=set_prepared["overall_chain_site_masks_by_set"],
+                source_metadata_by_set=set_prepared["source_metadata_by_set"],
+                coverage_tmax_ns=set_prepared["coverage_tmax_ns"],
+            )
+            if report:
+                print(result.report())
+        return result
     fits = {}
     tau_grid = np.full(data.shape[:2], np.nan)
     accepted = np.zeros(data.shape[:2], dtype=bool)
@@ -2370,6 +2939,7 @@ def plot_reconfiguration_correlations(
     show_fit_parameters: bool = False,
     resnum: Optional[int] = None,
     show_chains: bool = False,
+    show_sets: bool = False,
     uncertainty: Optional[str] = "sem",
     time_unit: str = "ns",
     xscale: str = "linear",
@@ -2418,11 +2988,48 @@ def plot_reconfiguration_correlations(
     Its parameters are available with show_fit_parameters=True. Correlation
     shading remains pointwise across-chain SD/SEM, not a bootstrap fit band.
 
+    For a cross-set aggregate, pass the combined fitted result directly (or a
+    flat mapping/sequence of combined fits). Alternatively supply the original
+    simulation mapping with fits=combined_fit. Saved set means are plotted with
+    pointwise across-SET SD/SEM shading; show_sets=True overlays individual set
+    means. Physical-chain overlays are not defined for that combined curve.
+    Bootstrap parameter uncertainty is separate from this descriptive shading.
+
     colors and labels can be keyed mappings or ordered sequences. The fit line
     matches the corresponding correlation color by default. fit_labels can
     override auto-generated legend entries for fitted curves. legend=False
     suppresses the legend, and legend_kwargs is forwarded to ax.legend().
     """
+    if not isinstance(show_sets, (bool, np.bool_)):
+        raise TypeError("show_sets must be a boolean")
+    if fits is None and isinstance(correlations, ReconfigurationSetAggregateTimeResult):
+        fits, correlations = correlations, correlations.set_mean_correlations
+    elif (
+        fits is None
+        and isinstance(correlations, Mapping)
+        and correlations
+        and all(
+            isinstance(value, ReconfigurationSetAggregateTimeResult)
+            for value in correlations.values()
+        )
+    ):
+        fits = correlations
+        correlations = {key: value.set_mean_correlations for key, value in fits.items()}
+    elif (
+        fits is None
+        and isinstance(correlations, Sequence)
+        and correlations
+        and all(isinstance(value, ReconfigurationSetAggregateTimeResult) for value in correlations)
+    ):
+        fits = correlations
+        correlations = [value.set_mean_correlations for value in fits]
+    if isinstance(fits, ReconfigurationSetAggregateTimeResult):
+        correlations = _set_aggregate_for_plot(correlations, fits)
+    elif isinstance(fits, Mapping) and isinstance(correlations, Mapping):
+        correlations = dict(correlations)
+        for key, value in fits.items():
+            if isinstance(value, ReconfigurationSetAggregateTimeResult) and key in correlations:
+                correlations[key] = _set_aggregate_for_plot(correlations[key], value)
     if not isinstance(include_flagged_fits, (bool, np.bool_)):
         raise TypeError("include_flagged_fits must be a boolean")
     if not isinstance(show_fit_parameters, (bool, np.bool_)):
@@ -2469,6 +3076,13 @@ def plot_reconfiguration_correlations(
         predictions = None
         aggregate_item = None
         aggregate_mode = isinstance(fit, ReconfigurationAggregateTimeResult)
+        set_mode = isinstance(fit, ReconfigurationSetAggregateTimeResult)
+        if set_mode and show_chains:
+            raise ValueError(
+                "cross-set fits do not expose physical-chain overlays; use show_sets=True"
+            )
+        if show_sets and not set_mode:
+            raise ValueError("show_sets=True requires a cross-simulation aggregate fit")
         if fit is not None:
             if fit.chain_labels != raw.chain_labels or not np.array_equal(
                 fit.residue_numbers, raw.residue_numbers
@@ -2490,7 +3104,11 @@ def plot_reconfiguration_correlations(
             if not np.array_equal(fit.lag_time_ns, raw.lag_time_ns):
                 raise ValueError(f"{key}: aggregate fit and correlation have different lag grids")
             if site is None:
-                rows = _aggregate_correlation_rows(grid, fit.overall_site_mask)
+                rows = (
+                    np.asarray(fit.overall_correlations_by_set)
+                    if set_mode
+                    else _aggregate_correlation_rows(grid, fit.overall_site_mask)
+                )
                 rows = rows[np.any(fit.overall_site_mask, axis=1)]
                 expected_mean = fit.aggregate_correlation
                 aggregate_item = fit.fit
@@ -2583,7 +3201,7 @@ def plot_reconfiguration_correlations(
             if yscale == "log":
                 fill &= mean - error > 0
             ax.fill_between(x, mean - error, mean + error, where=fill, alpha=0.2, color=color)
-        if show_chains:
+        if show_chains or (show_sets and set_mode):
             for row in rows:
                 keep = np.isfinite(row) & ((x > 0) if xscale == "log" else True)
                 if yscale == "log":
@@ -2963,6 +3581,7 @@ def plot_reconfiguration_times(
     uncertainty: Optional[str] = "sem",
     show_chains: bool = False,
     min_chains: int = 1,
+    min_sets: int = 1,
     time_unit: str = "ns",
     yscale: str = "log",
     xlim: Optional[tuple[float, float]] = None,
@@ -3006,6 +3625,12 @@ def plot_reconfiguration_times(
     Individual fits use per-residue means, SD or SEM across accepted chains.
     min_chains applies separately to each component, so single-exponential
     fits do not count toward a fast/slow component's coverage.
+
+    For cross-simulation aggregate results, errors are whole-set bootstrap SEs.
+    min_chains counts physical contributors across runs, while min_sets optionally
+    requires that many simulation sets at a residue. No extra kinetic scaling is
+    applied. Existing reference lines/bands, component styles and log axes work
+    unchanged with these cross-set results.
 
     The x axis retains PDB residue numbers, sorted numerically. Excluding
     termini does NOT renumber the remaining residues. yscale may be 'linear'
@@ -3062,6 +3687,7 @@ def plot_reconfiguration_times(
         if not np.isfinite(value) or value < 0:
             raise ValueError(f"{name} must be finite and nonnegative")
     min_chains = _integer(min_chains, "min_chains", 1)
+    min_sets = _integer(min_sets, "min_sets", 1)
     factor, unit = _plot_scale(time_unit)
     references = _prepare_time_reference_lines(
         reference_values,
@@ -3075,6 +3701,9 @@ def plot_reconfiguration_times(
         if fit.residue_numbers is None:
             raise ValueError("residue profiles require torsion fits, not scalar/Rg fits")
         aggregate_mode = isinstance(fit, ReconfigurationAggregateTimeResult)
+        set_mode = isinstance(fit, ReconfigurationSetAggregateTimeResult)
+        if not set_mode and min_sets > 1:
+            raise ValueError("min_sets>1 requires cross-simulation aggregate results")
         if aggregate_mode and show_chains:
             raise ValueError(
                 "aggregate fits have no individual-chain fitted times; "
@@ -3095,6 +3724,8 @@ def plot_reconfiguration_times(
             values, errors, counts, rows = _residue_time_profile(fit, component, uncertainty)
             y = values[order] * factor
             enough = counts[order] >= min_chains
+            if set_mode:
+                enough &= fit.residue_n_sets[order] >= min_sets
             good = enough & np.isfinite(y)
             if yscale == "log":
                 good &= y > 0
