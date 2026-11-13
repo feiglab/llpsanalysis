@@ -464,6 +464,8 @@ __all__ = [
     "load_multiple_quenching_time_series_csv",
     "make_sample_survival",
     "fit_sample_survival",
+    "overall_D_from_binned",
+    "as_ns",
     # Re-exported mdsim objects and functions used by notebooks
     "CAContactTrajectoryResult",
     "CondensateResult",
