@@ -466,6 +466,8 @@ __all__ = [
     "fit_sample_survival",
     "overall_D_from_binned",
     "as_ns",
+    "kr",
+    "estimate_D_from_kDplus",
     # Re-exported mdsim objects and functions used by notebooks
     "CAContactTrajectoryResult",
     "CondensateResult",
