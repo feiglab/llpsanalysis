@@ -3729,6 +3729,23 @@ def _draw_time_reference_lines(
         )
 
 
+def _plot_tick_positions(ticks: Any, name: str, *, positive: bool = False) -> Optional[np.ndarray]:
+    """Validate optional explicit major-tick positions; an empty list hides ticks."""
+    if ticks is None:
+        return None
+    if isinstance(ticks, (str, bytes)):
+        raise TypeError(f"{name} must be a one-dimensional sequence of numbers")
+    try:
+        positions = np.asarray(ticks, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{name} must be a one-dimensional sequence of numbers") from exc
+    if positions.ndim != 1 or not np.all(np.isfinite(positions)):
+        raise ValueError(f"{name} must be a one-dimensional sequence of finite numbers")
+    if positive and np.any(positions <= 0):
+        raise ValueError(f"{name} must contain only positive numbers on a log axis")
+    return positions
+
+
 def plot_reconfiguration_times(
     fits: Any,
     *,
@@ -3741,6 +3758,8 @@ def plot_reconfiguration_times(
     yscale: str = "log",
     xlim: Optional[tuple[float, float]] = None,
     ylim: Optional[tuple[float, float]] = None,
+    xticks: Optional[Sequence[float]] = None,
+    yticks: Optional[Sequence[float]] = None,
     labels: Optional[Union[Mapping[str, str], Sequence[str]]] = None,
     colors: Optional[Union[Mapping[str, Any], Sequence[Any], str]] = None,
     component_colors: Optional[Mapping[str, Any]] = None,
@@ -3794,6 +3813,10 @@ def plot_reconfiguration_times(
     gaps. On a log axis, symmetric error bars reaching nonpositive times are
     omitted with a warning; their estimates remain visible. Use a linear axis
     to see those full error bars; uncertainty=None disables errors entirely.
+    ``xticks`` and ``yticks`` accept explicit lists of major tick positions;
+    None (default) uses automatic ticks. X ticks are PDB residue numbers,
+    and y ticks are expressed in the displayed ``time_unit``. On a log y axis,
+    y tick positions must be positive. An empty list hides that axis's ticks.
 
     One result, a named mapping, or an ordered sequence can be supplied.
     colors/labels retain their dataset-level meanings. For a single dataset,
@@ -3844,6 +3867,8 @@ def plot_reconfiguration_times(
     min_chains = _integer(min_chains, "min_chains", 1)
     min_sets = _integer(min_sets, "min_sets", 1)
     factor, unit = _plot_scale(time_unit)
+    x_tick_positions = _plot_tick_positions(xticks, "xticks")
+    y_tick_positions = _plot_tick_positions(yticks, "yticks", positive=(yscale == "log"))
     references = _prepare_time_reference_lines(
         reference_values,
         reference_time_unit=reference_time_unit,
@@ -3993,7 +4018,12 @@ def plot_reconfiguration_times(
         ylabel=f"reconfiguration time ({unit})" if ylabel is None else ylabel,
         yscale=yscale,
     )
-    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    if x_tick_positions is None:
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    else:
+        ax.set_xticks(x_tick_positions)
+    if y_tick_positions is not None:
+        ax.set_yticks(y_tick_positions)
     _draw_time_reference_lines(ax, references, yscale=yscale)
     if title is not None:
         ax.set_title(title)
