@@ -12169,15 +12169,22 @@ def overall_D_from_binned(msd, series, refs, dt_ns, start_ns, fit_min, fit_max):
 
 @dataclass(frozen=True)
 class FirstPassageResult:
-    """Pooled first-passage statistics for a fixed target and follow-up horizon.
+    """Pooled first-passage statistics for a fixed target.
 
     All durations and time errors are in physical ns. Each eligible origin
     contributes one observation, not one observation per contact episode.
-    ``restricted_mean_ns`` is E[min(T, horizon)] and includes nonhits. The
-    unrestricted sample mean ``mean_fpt_ns`` is only reported in bins in which
-    every eligible origin hits. ``mean_completed_ns`` excludes nonhits and
-    can severely underestimate slow dynamics. Errors are delete-one-cluster
-    jackknife estimates, not SEMs treating overlapping origins as independent.
+    ``followup_mode='variable'`` uses Kaplan--Meier estimation with censoring
+    at the last contiguous observed frame. ``horizon_ns`` is the common
+    integration limit, not a limit on passage detection; ``horizon_frames`` is
+    its integer frame count rounded down. ``restricted_mean_ns``
+    estimates E[min(T, horizon)] and ``hit_fraction`` estimates P(T <= horizon).
+    These are NaN where the requested horizon is unsupported by the data.
+    ``mean_fpt_ns`` is the integrated KM mean when the estimated tail closes,
+    otherwise NaN. In fixed mode, these are the original empirical quantities.
+    ``mean_completed_ns`` and ``observed_hit_fraction`` are descriptive raw
+    quantities that ignore variable censoring. Errors are cluster jackknifes,
+    not SEMs treating overlapping origins as independent. A closed KM tail
+    does not prove that the true population tail has been fully sampled.
     """
 
     r_edges_nm: np.ndarray
@@ -12216,6 +12223,23 @@ class FirstPassageResult:
     n_clusters_per_bin: np.ndarray
     n_hit_clusters_per_bin: np.ndarray
     notes: tuple[str, ...]
+    # Defaults permit reading result caches written by the fixed-horizon version.
+    followup_mode: str = "fixed"
+    censored_steps_by_bin: Optional[tuple[np.ndarray, ...]] = None
+    requested_rmst_horizon_ns: Optional[float] = None
+    max_followup_ns_per_bin: Optional[np.ndarray] = None
+    n_at_risk_at_horizon: Optional[np.ndarray] = None
+    survival_at_last_observation: Optional[np.ndarray] = None
+
+    @property
+    def observed_hit_fraction(self) -> np.ndarray:
+        """Raw fraction of origins with a hit during their own follow-up."""
+        return _fpt_divide(self.n_hits, self.n_origins)
+
+    @property
+    def rmst_supported(self) -> np.ndarray:
+        """Bins where the common integration limit has estimable survival."""
+        return np.isfinite(self.restricted_mean_ns)
 
     @property
     def r0_centers_nm(self) -> np.ndarray:
@@ -12287,28 +12311,44 @@ class FirstPassageResult:
             )
         )
 
-    def survival_curve(self, r0_nm: float, *, time_unit: str = "ns") -> np.ndarray:
-        """Return (lag, P(T > lag)) for the initial-distance bin containing r0.
-
-        This empirical survival curve uses the fixed set of eligible origins,
-        includes nonhits in its denominator, and stops at the observed horizon.
-        Use a steps-post plot. At an exact event lag, that event is counted as a
-        hit; a nonhit remains in the survival probability at the horizon.
-        """
+    def _bin_index(self, r0_nm: float) -> int:
         r0 = float(r0_nm)
         edges = self.r_edges_nm
         if not np.isfinite(r0) or not edges[0] <= r0 <= edges[-1]:
             raise ValueError("r0_nm is outside the initial-distance bins")
         index = min(len(edges) - 2, int(np.searchsorted(edges, r0, side="right") - 1))
-        n = int(self.n_origins[index])
-        if n == 0:
+        if not self.n_origins[index]:
             raise ValueError(f"no eligible origins in the bin containing {r0:g} nm")
-        times, counts = np.unique(self.completed_steps_by_bin[index], return_counts=True)
-        steps = np.unique(np.r_[0, times, self.horizon_frames]).astype(np.int64)
-        cum = np.r_[0, np.cumsum(counts, dtype=np.int64)]
-        survived = 1.0 - cum[np.searchsorted(times, steps, side="right")] / n
+        return index
+
+    def survival_curve(
+        self, r0_nm: float, *, time_unit: str = "ns", include_risk: bool = False
+    ) -> np.ndarray:
+        """Return lag and P(T > lag) for the bin containing r0 (steps-post).
+
+        In variable mode this is the pooled KM curve through the last observed
+        duration, even when the RMST integration limit is shorter. In fixed
+        mode it is the empirical survival through the common horizon. If
+        include_risk=True, also return number at risk just BEFORE each lag,
+        event count and censor count. Tied events precede censoring. No
+        positive survival tail is extrapolated past the last observation.
+        """
+        index = self._bin_index(r0_nm)
+        event = self.completed_steps_by_bin[index]
+        if self.censored_steps_by_bin is None:
+            censor = np.full(int(self.n_censored[index]), self.horizon_frames, dtype=np.int64)
+        else:
+            censor = self.censored_steps_by_bin[index]
+        steps, survived, risk, deaths, censored = _fpt_km_from_samples(event, censor)
+        if self.followup_mode == "fixed" and steps[-1] < self.horizon_frames:
+            steps = np.r_[steps, self.horizon_frames]
+            survived = np.r_[survived, 0.0]
+            risk, deaths, censored = (np.r_[x, 0] for x in (risk, deaths, censored))
         scale, _ = _time_scale_from_ns(time_unit)
-        return np.column_stack((steps * self.physical_dt_ns * scale, survived))
+        columns = [steps * self.physical_dt_ns * scale, survived]
+        if include_risk:
+            columns.extend((risk, deaths, censored))
+        return np.column_stack(columns)
 
 
 def _fpt_sources(data: Any, prop: str, path: str = "data") -> list[tuple[str, Any]]:
@@ -12373,6 +12413,179 @@ def _fpt_jackknife(sums: np.ndarray, counts: np.ndarray) -> tuple[np.ndarray, np
     return error, n_contributing
 
 
+def _fpt_km_from_counts(event: np.ndarray, censor: np.ndarray):
+    """KM on a common integer frame grid, evaluated at observed durations only.
+
+    Input count arrays have one entry per lag step. Tied events are evaluated
+    with all subjects at risk before censoring at that step. The origin is
+    added explicitly; eligible origins have at least one observed interval.
+    """
+    total = event + censor
+    steps = np.flatnonzero(total)
+    if not steps.size:
+        return (
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=float),
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.int64),
+        )
+    deaths = event[steps]
+    censored = censor[steps]
+    risk = np.cumsum(total[steps][::-1], dtype=np.int64)[::-1]
+    surv = np.cumprod(1.0 - deaths / risk)
+    return (
+        np.r_[0, steps],
+        np.r_[1.0, surv],
+        np.r_[risk[0], risk],
+        np.r_[0, deaths],
+        np.r_[0, censored],
+    )
+
+
+def _fpt_km_from_samples(event: np.ndarray, censor: np.ndarray):
+    maximum = max(int(event.max()) if event.size else 0, int(censor.max()) if censor.size else 0)
+    return _fpt_km_from_counts(
+        np.bincount(event, minlength=maximum + 1), np.bincount(censor, minlength=maximum + 1)
+    )
+
+
+def _fpt_km_metrics(curve, horizon_steps: float) -> tuple[float, float, float]:
+    """Return RMST (steps), hit probability at H, and closed-tail KM mean.
+
+    A positive tail is not extrapolated, even for the jackknife replicates.
+    Integrate the right-continuous step function, not trapezoidal interpolation.
+    """
+    steps, survival = curve[:2]
+    if not steps.size:
+        return np.nan, np.nan, np.nan
+    area = np.dot(np.diff(steps), survival[:-1])
+    closed = survival[-1] == 0.0
+    mean = float(area) if closed else np.nan
+    if horizon_steps > steps[-1] and not closed:
+        return np.nan, np.nan, mean
+    end = np.minimum(steps[1:], horizon_steps)
+    widths = np.maximum(end - steps[:-1], 0.0)
+    rmst = float(np.dot(widths, survival[:-1]))
+    # A closed tail is zero beyond the final event, so no extension is needed.
+    i = np.searchsorted(steps, horizon_steps, side="right") - 1
+    hit = float(np.clip(1.0 - survival[i], 0.0, 1.0))
+    return rmst, hit, mean
+
+
+def _fpt_km_jackknife(values: np.ndarray) -> np.ndarray:
+    """Delete-one-cluster error; undefined if any deletion loses support."""
+    n = values.shape[0]
+    if n < 2:
+        return np.full(values.shape[1], np.nan)
+    valid = np.all(np.isfinite(values), axis=0)
+    error = np.full(values.shape[1], np.nan)
+    if np.any(valid):
+        x = values[:, valid]
+        error[valid] = np.sqrt((n - 1.0) / n * np.sum((x - x.mean(axis=0)) ** 2, axis=0))
+    return error
+
+
+def _fpt_variable_statistics(
+    event_rows, censor_rows, origins, source_indices, uncertainty, requested_horizon_ns, physical_dt
+):
+    """Pool KM curves by origin, then jackknife complete chains or sources.
+
+    Only one initial-distance bin and one dense lag-count array per cluster
+    at a time are processed. The original durations are retained for plotting.
+    """
+    n_rows, n_bins = origins.shape
+    events, censors, curves = [], [], []
+    maximum = np.full(n_bins, np.nan)
+    tail = np.full(n_bins, np.nan)
+    empty = np.empty(0, dtype=np.int64)
+    for j in range(n_bins):
+        e = np.concatenate([x for x in event_rows[j].values()]) if event_rows[j] else empty.copy()
+        c = np.concatenate([x for x in censor_rows[j].values()]) if censor_rows[j] else empty.copy()
+        events.append(e)
+        censors.append(c)
+        curve = _fpt_km_from_samples(e, c)
+        curves.append(curve)
+        if curve[0].size:
+            maximum[j] = curve[0][-1]
+            tail[j] = curve[1][-1]
+    populated = np.isfinite(maximum)
+    if requested_horizon_ns is None:
+        # Largest common, estimable integration horizon across populated bins.
+        # Bins with zero KM tail support integration beyond their last event.
+        unresolved = populated & (tail > 0.0)
+        hframes = int(
+            np.min(maximum[unresolved]) if np.any(unresolved) else np.max(maximum[populated])
+        )
+    else:
+        # Integration itself can end between frames: survival is a step function.
+        hframes = requested_horizon_ns / physical_dt
+        if not np.isfinite(hframes):
+            raise ValueError("rmst_horizon_ns / physical_dt must be finite")
+        nearest = round(hframes)
+        if abs(hframes - nearest) <= 16 * np.finfo(float).eps * max(1.0, hframes):
+            hframes = float(nearest)  # avoid excluding a tied event by roundoff
+    horizon = hframes * physical_dt if requested_horizon_ns is None else requested_horizon_ns
+    metric = np.full((n_bins, 3), np.nan)
+    errors = np.full_like(metric, np.nan)
+    risk_at_h = np.zeros(n_bins, dtype=np.int64)
+    per_chain = np.full((n_rows, n_bins), np.nan)
+    cluster_ids = np.asarray(source_indices if uncertainty == "set" else np.arange(n_rows))
+    n_clusters = np.zeros(n_bins, dtype=np.int64)
+    for j, curve in enumerate(curves):
+        if not populated[j]:
+            continue
+        metric[j] = _fpt_km_metrics(curve, hframes)
+        steps, _, risk = curve[:3]
+        at = int(np.searchsorted(steps, hframes, side="left"))
+        if at < len(steps):
+            risk_at_h[j] = risk[at]
+        rows = np.flatnonzero(origins[:, j])
+        for row in rows:
+            one = _fpt_km_from_samples(
+                event_rows[j].get(int(row), empty), censor_rows[j].get(int(row), empty)
+            )
+            per_chain[row, j] = _fpt_km_metrics(one, hframes)[0] * physical_dt
+        if uncertainty == "none":
+            continue
+        groups = np.unique(cluster_ids[rows])
+        n_clusters[j] = groups.size
+        if groups.size < 2:
+            continue
+        length = int(maximum[j]) + 1
+        total_e = np.bincount(events[j], minlength=length)
+        total_c = np.bincount(censors[j], minlength=length)
+        loo = []
+        for group in groups:
+            group_rows = rows[cluster_ids[rows] == group]
+            ge = np.zeros(length, dtype=np.int64)
+            gc = np.zeros(length, dtype=np.int64)
+            for row in group_rows:
+                if int(row) in event_rows[j]:
+                    ge += np.bincount(event_rows[j][int(row)], minlength=length)
+                if int(row) in censor_rows[j]:
+                    gc += np.bincount(censor_rows[j][int(row)], minlength=length)
+            deleted = _fpt_km_from_counts(total_e - ge, total_c - gc)
+            loo.append(_fpt_km_metrics(deleted, hframes))
+        errors[j] = _fpt_km_jackknife(np.asarray(loo))
+    # Columns 0 and 2 are durations; 1 is dimensionless probability.
+    metric[:, (0, 2)] *= physical_dt
+    errors[:, (0, 2)] *= physical_dt
+    return SimpleNamespace(
+        horizon_ns=horizon,
+        horizon_frames=int(math.floor(hframes)),
+        metric=metric,
+        errors=errors,
+        per_chain=per_chain,
+        events=tuple(events),
+        censors=tuple(censors),
+        max_followup_ns=maximum * physical_dt,
+        tail=tail,
+        risk_at_h=risk_at_h,
+        n_clusters=n_clusters,
+    )
+
+
 def calculate_first_passage_times(
     data: Any,
     delta_t: Any,
@@ -12382,6 +12595,7 @@ def calculate_first_passage_times(
     bins: Union[int, Sequence[float], np.ndarray] = 15,
     value_range: Optional[tuple[float, float]] = None,
     max_lag_ns: Any = None,
+    rmst_horizon_ns: Any = None,
     kinetic_scale: float = 1.0,
     include_chains: Any = None,
     exclude_chains: Any = None,
@@ -12415,8 +12629,18 @@ def calculate_first_passage_times(
     Only passages within the selected interval are considered. ``kinetic_scale``
     multiplies lag times after selection, and ``max_lag_ns`` is the requested
     PHYSICAL follow-up horizon (ns or time Quantity), rounded down to a stored
-    frame interval. If omitted, use half the shortest selected trajectory span.
-    Use an explicit common physical horizon when comparing systems.
+    frame interval, preserving the original fixed-horizon algorithm. With
+    ``max_lag_ns=None`` (default), use all origins with positive contiguous
+    follow-up, and follow each until its first hit or last observed frame.
+    The pooled Kaplan--Meier estimate accounts for variable censoring times.
+    ``rmst_horizon_ns`` (physical ns or time Quantity) is optional in variable
+    mode only. It sets a common integration limit AFTER all passages are
+    observed; it never truncates passage detection or excludes late origins.
+    If omitted, use the largest common supported integration horizon across
+    populated bins (largest last-observed lag if all KM tails close). A bin
+    whose survival is positive at its last observation before the requested
+    horizon has NaN RMST and hit probability; no tail extrapolation is done.
+    Use the same explicit integration limit when comparing systems.
 
     Origins are all sampled frames outside the target in the requested initial
     distance bins, with ``origin_stride`` applied to the sliced frame grid.
@@ -12429,13 +12653,17 @@ def calculate_first_passage_times(
     Integer bins use value_range (default target_nm to 8 nm); explicit edges
     override value_range. Frames already in the target are not eligible origins.
 
-    Each origin must have a complete, contiguous horizon, irrespective of
-    whether a hit occurs early. NaN/inf distances break continuity; negative
-    finite distances are rejected. All nonhits contribute horizon to the
-    restricted mean E[min(T,horizon)], and count as right-censored. No waiting
-    time beyond the horizon is invented. The unrestricted sample mean is NaN
-    if any origins in a bin do not reach the target. A completed-only mean is
-    available separately for diagnostic use (biased toward fast passages).
+    NaN/inf distances break continuity; negative finite distances are rejected.
+    Variable mode censors at the last finite frame before a gap or endpoint;
+    zero-follow-up origins are excluded. KM assumes censoring is noninformative
+    conditional on the initial-distance bin (e.g. stationary time origins).
+    RMST is the integral of the KM step function through the common horizon;
+    the unrestricted KM mean is NaN unless its survival reaches zero. A closed
+    tail can still be poorly sampled. In fixed mode each origin must have a
+    complete contiguous horizon, irrespective of whether a hit occurs early.
+    Nonhits contribute the horizon to the restricted mean and the ordinary
+    mean is reported only if every origin hits. In either mode, the completed-
+    only mean is a diagnostic, not a censoring-corrected mean.
 
     Uncertainty uses a pooled delete-one-cluster jackknife: 'auto' uses separate
     input leaves as set replicates if multiple leaves, otherwise chain rows;
@@ -12543,22 +12771,31 @@ def calculate_first_passage_times(
         selected.append((name, array, labels, indices, start, stop))
 
     requested = None if max_lag_ns is None else _time_value_to_ns(max_lag_ns, name="max_lag_ns")
-    if requested is None:
-        hframes = max(1, min(stop - start - 1 for _, _, _, _, start, stop in selected) // 2)
-    else:
+    rmst_requested = (
+        None
+        if rmst_horizon_ns is None
+        else _time_value_to_ns(rmst_horizon_ns, name="rmst_horizon_ns")
+    )
+    variable = requested is None
+    if rmst_requested is not None and (rmst_requested <= 0 or not variable):
+        raise ValueError("rmst_horizon_ns must be > 0 and is only valid with max_lag_ns=None")
+    if not variable:
         if requested <= 0:
             raise ValueError("max_lag_ns must be > 0")
         ratio = requested / physical_dt
         hframes = int(math.floor(ratio + 16 * np.finfo(float).eps * max(1.0, ratio)))
-    if hframes < 1:
-        raise ValueError("max_lag_ns is smaller than one physical frame interval")
-    horizon = hframes * physical_dt
-    too_short = [name for name, _, _, _, start, stop in selected if stop - start - 1 < hframes]
-    if too_short:
-        raise ValueError(
-            f"max_lag_ns exceeds the selected trajectory span for {too_short}; "
-            "choose a common shorter physical horizon"
-        )
+        if hframes < 1:
+            raise ValueError("max_lag_ns is smaller than one physical frame interval")
+        horizon = hframes * physical_dt
+        too_short = [name for name, _, _, _, start, stop in selected if stop - start - 1 < hframes]
+        if too_short:
+            raise ValueError(
+                f"max_lag_ns exceeds the selected trajectory span for {too_short}; "
+                "choose a common shorter physical horizon"
+            )
+    else:
+        hframes = 1  # only require one observed interval; integration limit set later
+        horizon = np.nan
 
     unc = str(uncertainty).strip().lower()
     if unc == "auto":
@@ -12573,6 +12810,9 @@ def calculate_first_passage_times(
     hit_steps_sum = np.zeros(shape, dtype=float)
     r0_sum = np.zeros(shape, dtype=float)
     events: list[list[np.ndarray]] = [[] for _ in range(n_bins)]
+    # Sparse duration lists per bin and row, only used in variable mode.
+    event_parts = [{} for _ in range(n_bins)]
+    censor_parts = [{} for _ in range(n_bins)]
     chain_labels = []
     chain_sources = []
     source_indices = []
@@ -12612,7 +12852,9 @@ def calculate_first_passage_times(
                 # in O(n_frames), not a separate search over each future path.
                 next_hit = np.minimum.accumulate(np.where(target_mask, grid, n)[::-1])[::-1]
                 passage = next_hit[ii] - ii
-                reached = (next_hit[ii] < n) & (passage <= hframes)
+                reached = next_hit[ii] < n
+                if not variable:
+                    reached &= passage <= hframes
                 origins[row_index] += np.bincount(bb, minlength=n_bins)
                 r0_sum[row_index] += np.bincount(bb, weights=x[ii], minlength=n_bins)
                 hits[row_index] += np.bincount(bb[reached], minlength=n_bins)
@@ -12620,7 +12862,16 @@ def calculate_first_passage_times(
                     bb[reached], weights=passage[reached], minlength=n_bins
                 )
                 for j in np.unique(bb[reached]):
-                    events[int(j)].append(passage[reached & (bb == j)].copy())
+                    part = passage[reached & (bb == j)].copy()
+                    if variable:
+                        event_parts[int(j)].setdefault(row_index, []).append(part)
+                    else:
+                        events[int(j)].append(part)
+                if variable:
+                    for j in np.unique(bb[~reached]):
+                        # The final finite frame, not the following gap/frame.
+                        part = (n - 1 - ii[~reached & (bb == j)]).copy()
+                        censor_parts[int(j)].setdefault(row_index, []).append(part)
             row_index += 1
 
     n_origins = origins.sum(axis=0)
@@ -12631,41 +12882,104 @@ def calculate_first_passage_times(
         )
     n_censored = n_origins - n_hits
     hit_sum_ns = hit_steps_sum * physical_dt
-    rmst_sum_ns = (hit_steps_sum + (origins - hits) * hframes) * physical_dt
-    restricted = _fpt_divide(rmst_sum_ns.sum(axis=0), n_origins)
     completed = _fpt_divide(hit_sum_ns.sum(axis=0), n_hits)
-    fraction = _fpt_divide(n_hits, n_origins)
-    mean_fpt = np.where(n_censored == 0, completed, np.nan)
-    group_origins, group_hits, group_rmst, group_completed = origins, hits, rmst_sum_ns, hit_sum_ns
+    group_origins, group_hits, group_completed = origins, hits, hit_sum_ns
     if unc == "set":
         sid = np.asarray(source_indices)
         group_origins = np.stack([origins[sid == j].sum(axis=0) for j in range(len(selected))])
         group_hits = np.stack([hits[sid == j].sum(axis=0) for j in range(len(selected))])
-        group_rmst = np.stack([rmst_sum_ns[sid == j].sum(axis=0) for j in range(len(selected))])
         group_completed = np.stack([hit_sum_ns[sid == j].sum(axis=0) for j in range(len(selected))])
     if unc == "none":
-        rmst_se = completed_se = fraction_se = np.full(n_bins, np.nan)
-        n_clusters = n_hit_clusters = np.zeros(n_bins, dtype=np.int64)
+        completed_se = np.full(n_bins, np.nan)
+        n_hit_clusters = np.zeros(n_bins, dtype=np.int64)
     else:
-        rmst_se, n_clusters = _fpt_jackknife(group_rmst, group_origins)
         completed_se, n_hit_clusters = _fpt_jackknife(group_completed, group_hits)
-        fraction_se, _ = _fpt_jackknife(group_hits, group_origins)
 
     notes = [
         "Pooled by eligible time origin, not by episode or chain mean.",
-        "Nonhits are censored at the common horizon; restricted mean is a lower bound on the population MFPT, not an extrapolated tail.",
         "Passages are to a target observed at saved frames; no between-frame crossing interpolation.",
     ]
-    if requested is None:
-        notes.append(
-            "Horizon chosen automatically as half the shortest selected span; specify max_lag_ns for comparisons."
+    extra = {}
+    if variable:
+        event_rows = [
+            {
+                row: np.concatenate(parts) if len(parts) > 1 else parts[0]
+                for row, parts in by_row.items()
+            }
+            for by_row in event_parts
+        ]
+        censor_rows = [
+            {
+                row: np.concatenate(parts) if len(parts) > 1 else parts[0]
+                for row, parts in by_row.items()
+            }
+            for by_row in censor_parts
+        ]
+        del event_parts, censor_parts
+        km = _fpt_variable_statistics(
+            event_rows, censor_rows, origins, source_indices, unc, rmst_requested, physical_dt
         )
-    elif not math.isclose(horizon, requested, rel_tol=1e-12, abs_tol=1e-12):
-        notes.append(f"Requested horizon {requested:g} ns rounded down to {horizon:g} ns.")
-    if invalid_count:
-        notes.append(
-            f"{invalid_count} nonfinite frames break continuity; incomplete follow-up origins excluded even if an early hit was observed."
+        restricted, fraction, mean_fpt = km.metric.T
+        rmst_se, fraction_se, mean_se = km.errors.T
+        horizon, hframes = km.horizon_ns, km.horizon_frames
+        per_chain_rmst = km.per_chain
+        n_clusters = km.n_clusters
+        completed_steps = km.events
+        extra = dict(
+            followup_mode="variable",
+            censored_steps_by_bin=km.censors,
+            requested_rmst_horizon_ns=rmst_requested,
+            max_followup_ns_per_bin=km.max_followup_ns,
+            n_at_risk_at_horizon=km.risk_at_h,
+            survival_at_last_observation=km.tail,
         )
+        notes.append(
+            "Variable follow-up: censored at the last contiguous observed frame; zero-follow-up origins excluded. Kaplan--Meier assumes noninformative censoring within each initial-distance bin."
+        )
+        notes.append(
+            "Hit fraction is KM probability of reaching the target by the RMST horizon; n_hits counts all observed hits, including later ones."
+        )
+        if rmst_requested is None:
+            notes.append(
+                f"Automatic common supported RMST horizon: {horizon:g} physical ns. Set rmst_horizon_ns explicitly for comparisons."
+            )
+        unsupported = (n_origins > 0) & ~np.isfinite(restricted)
+        if np.any(unsupported):
+            message = f"RMST horizon {horizon:g} ns exceeds observed support with positive survival in {np.sum(unsupported)} populated bin(s); returned NaN rather than extrapolating."
+            notes.append(message)
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
+        if invalid_count:
+            notes.append(
+                f"{invalid_count} nonfinite frames break continuity; passages before gaps retained, other origins censored before the gap."
+            )
+    else:
+        rmst_sum_ns = (hit_steps_sum + (origins - hits) * hframes) * physical_dt
+        restricted = _fpt_divide(rmst_sum_ns.sum(axis=0), n_origins)
+        fraction = _fpt_divide(n_hits, n_origins)
+        mean_fpt = np.where(n_censored == 0, completed, np.nan)
+        group_rmst = rmst_sum_ns
+        if unc == "set":
+            group_rmst = np.stack([rmst_sum_ns[sid == j].sum(axis=0) for j in range(len(selected))])
+        if unc == "none":
+            rmst_se = fraction_se = np.full(n_bins, np.nan)
+            n_clusters = np.zeros(n_bins, dtype=np.int64)
+        else:
+            rmst_se, n_clusters = _fpt_jackknife(group_rmst, group_origins)
+            fraction_se, _ = _fpt_jackknife(group_hits, group_origins)
+        mean_se = np.where(n_censored == 0, rmst_se, np.nan)
+        per_chain_rmst = _fpt_divide(rmst_sum_ns, origins)
+        completed_steps = tuple(
+            np.concatenate(v) if v else np.empty(0, dtype=np.int64) for v in events
+        )
+        notes.append(
+            "Nonhits are censored at the common horizon; restricted mean is a lower bound on the population MFPT, not an extrapolated tail."
+        )
+        if not math.isclose(horizon, requested, rel_tol=1e-12, abs_tol=1e-12):
+            notes.append(f"Requested horizon {requested:g} ns rounded down to {horizon:g} ns.")
+        if invalid_count:
+            notes.append(
+                f"{invalid_count} nonfinite frames break continuity; incomplete follow-up origins excluded even if an early hit was observed."
+            )
     absent_sources = [
         name
         for name in dict.fromkeys(chain_sources)
@@ -12676,7 +12990,7 @@ def calculate_first_passage_times(
         warnings.warn(notes[-1], RuntimeWarning, stacklevel=2)
     if unc != "none":
         notes.append(
-            f"Jackknife errors across {unc} clusters; overlapping origins and correlated chains are not independent replicates."
+            f"Jackknife errors across {unc} clusters; overlapping origins and correlated chains are not independent replicates. Errors are NaN if a deletion loses required tail support."
         )
     return FirstPassageResult(
         r_edges_nm=edges,
@@ -12702,21 +13016,20 @@ def calculate_first_passage_times(
         mean_completed_ns=completed,
         completed_stderr_ns=completed_se,
         mean_fpt_ns=mean_fpt,
-        mean_fpt_stderr_ns=np.where(n_censored == 0, rmst_se, np.nan),
-        completed_steps_by_bin=tuple(
-            np.concatenate(v) if v else np.empty(0, dtype=np.int64) for v in events
-        ),
+        mean_fpt_stderr_ns=mean_se,
+        completed_steps_by_bin=completed_steps,
         source_labels=tuple(item[0] for item in selected),
         chain_labels=tuple(chain_labels),
         chain_source_labels=tuple(chain_sources),
         frame_slices=tuple((item[4], item[5]) for item in selected),
         n_origins_per_chain=origins,
         n_hits_per_chain=hits,
-        restricted_mean_per_chain_ns=_fpt_divide(rmst_sum_ns, origins),
+        restricted_mean_per_chain_ns=per_chain_rmst,
         uncertainty=unc,
         n_clusters_per_bin=n_clusters,
         n_hit_clusters_per_bin=n_hit_clusters,
         notes=tuple(notes),
+        **extra,
     )
 
 
@@ -12734,8 +13047,10 @@ def plot_first_passage_times(
     All plot_errorbar_datasets styling options (colors, labels, connect,
     fill_uncertainty, reference_values, xlim, ylim, yscale, save_path, etc.)
     are forwarded. Time conversion applies to y and errors, not x distances.
-    For a fair restricted-mean comparison use the same physical horizon and
-    target for all curves unless intentionally comparing different targets.
+    For a fair restricted-mean comparison use the same physical integration
+    horizon and target for all curves unless intentionally comparing targets.
+    In variable mode, hit_fraction is KM P(T <= horizon), not the raw ratio
+    n_hits/n_origins. Bins without sufficient follow-up are omitted.
     If any plotted finite estimate lacks a jackknife error, all curves are
     plotted without error bars (with a warning); no zero error is invented.
     Use show_uncertainty=False for explicit points-only comparisons.
@@ -12749,11 +13064,11 @@ def plot_first_passage_times(
         )
         for key, result in mapping.items()
     }
-    if str(statistic).lower() in {"restricted_mean", "rmst", "hit_fraction"}:
+    if str(statistic).strip().lower() in {"restricted_mean", "rmst", "hit_fraction"}:
         horizons = [float(result.horizon_ns) for result in mapping.values()]
         if not np.allclose(horizons, horizons[0], rtol=1e-10, atol=1e-10):
             warnings.warn(
-                "Comparing different physical follow-up horizons; restricted means and hit fractions depend on horizon.",
+                "Comparing different physical integration horizons; restricted means and hit fractions depend on horizon.",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -12764,7 +13079,7 @@ def plot_first_passage_times(
         "rmst": f"Restricted mean first-passage time ({label})",
         "mean_fpt": f"Mean first-passage time ({label})",
         "mean_completed": f"Mean completed passage time ({label})",
-        "hit_fraction": "Fraction reaching target",
+        "hit_fraction": "Probability of reaching target by horizon",
     }
     if show_uncertainty and any(
         np.any(np.isfinite(v[:, 1]) & ~np.isfinite(v[:, 2])) for v in datasets.values()
