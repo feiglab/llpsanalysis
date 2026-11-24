@@ -426,6 +426,9 @@ __all__ = [
     "calculate",
     "calculate_averages",
     "calculate_on_off_rates",
+    "FirstPassageResult",
+    "calculate_first_passage_times",
+    "plot_first_passage_times",
     "calculate_translational_msd",
     "calculate_radial_translational_msd",
     "jackknife_rate_sem",
@@ -12159,3 +12162,633 @@ def overall_D_from_binned(msd, series, refs, dt_ns, start_ns, fit_min, fit_max):
     sem = np.std(D_refs, ddof=1) / np.sqrt(len(D_refs)) if len(D_refs) > 1 else np.nan
 
     return mean, sem, len(D_refs)
+
+
+# --- distance-conditioned first-passage times from cached trajectories -------
+
+
+@dataclass(frozen=True)
+class FirstPassageResult:
+    """Pooled first-passage statistics for a fixed target and follow-up horizon.
+
+    All durations and time errors are in physical ns. Each eligible origin
+    contributes one observation, not one observation per contact episode.
+    ``restricted_mean_ns`` is E[min(T, horizon)] and includes nonhits. The
+    unrestricted sample mean ``mean_fpt_ns`` is only reported in bins in which
+    every eligible origin hits. ``mean_completed_ns`` excludes nonhits and
+    can severely underestimate slow dynamics. Errors are delete-one-cluster
+    jackknife estimates, not SEMs treating overlapping origins as independent.
+    """
+
+    r_edges_nm: np.ndarray
+    r0_mean_nm: np.ndarray
+    target_nm: float
+    target_inclusive: bool
+    delta_t_ns: float
+    kinetic_scale: float
+    physical_dt_ns: float
+    horizon_ns: float
+    horizon_frames: int
+    requested_horizon_ns: Optional[float]
+    origin_stride: int
+    origin_mode: str
+    n_candidate_origins: np.ndarray
+    n_origins: np.ndarray
+    n_hits: np.ndarray
+    n_censored: np.ndarray
+    hit_fraction: np.ndarray
+    hit_fraction_stderr: np.ndarray
+    restricted_mean_ns: np.ndarray
+    restricted_stderr_ns: np.ndarray
+    mean_completed_ns: np.ndarray
+    completed_stderr_ns: np.ndarray
+    mean_fpt_ns: np.ndarray
+    mean_fpt_stderr_ns: np.ndarray
+    completed_steps_by_bin: tuple[np.ndarray, ...]
+    source_labels: tuple[str, ...]
+    chain_labels: tuple[str, ...]
+    chain_source_labels: tuple[str, ...]
+    frame_slices: tuple[tuple[int, int], ...]
+    n_origins_per_chain: np.ndarray
+    n_hits_per_chain: np.ndarray
+    restricted_mean_per_chain_ns: np.ndarray
+    uncertainty: str
+    n_clusters_per_bin: np.ndarray
+    n_hit_clusters_per_bin: np.ndarray
+    notes: tuple[str, ...]
+
+    @property
+    def r0_centers_nm(self) -> np.ndarray:
+        return 0.5 * (self.r_edges_nm[:-1] + self.r_edges_nm[1:])
+
+    @property
+    def n_excluded_followup(self) -> np.ndarray:
+        return self.n_candidate_origins - self.n_origins
+
+    @property
+    def rmst_ns(self) -> np.ndarray:
+        return self.restricted_mean_ns
+
+    @property
+    def stderr_ns(self) -> np.ndarray:
+        return self.restricted_stderr_ns
+
+    @property
+    def completed_times_ns(self) -> tuple[np.ndarray, ...]:
+        """Completed passage times per initial-distance bin; nonhits excluded."""
+        return tuple(steps * self.physical_dt_ns for steps in self.completed_steps_by_bin)
+
+    @property
+    def series(self) -> np.ndarray:
+        """Columns: r0 center, restricted mean (ns), jackknife error (ns),
+        eligible origin count, hit fraction. Compatible with plot_errorbar_datasets.
+        """
+        return self.as_errorbar_dataset()
+
+    def as_errorbar_dataset(
+        self,
+        *,
+        statistic: str = "restricted_mean",
+        time_unit: str = "ns",
+        min_origins: int = 1,
+    ) -> np.ndarray:
+        """Return x, y, symmetric error, origin count, hit fraction columns.
+
+        Choose 'restricted_mean' (default), 'mean_fpt', 'mean_completed', or
+        'hit_fraction'. Bins with insufficient origins have NaN y/error.
+        """
+        key = str(statistic).strip().lower()
+        values = {
+            "restricted_mean": (self.restricted_mean_ns, self.restricted_stderr_ns),
+            "rmst": (self.restricted_mean_ns, self.restricted_stderr_ns),
+            "mean_fpt": (self.mean_fpt_ns, self.mean_fpt_stderr_ns),
+            "mean_completed": (self.mean_completed_ns, self.completed_stderr_ns),
+            "hit_fraction": (self.hit_fraction, self.hit_fraction_stderr),
+        }
+        if key not in values:
+            raise ValueError(
+                "statistic must be 'restricted_mean', 'mean_fpt', "
+                "'mean_completed', or 'hit_fraction'"
+            )
+        nmin = _frame_index(min_origins, name="min_origins")
+        if nmin < 1:
+            raise ValueError("min_origins must be >= 1")
+        scale, _ = _time_scale_from_ns(time_unit)
+        if key == "hit_fraction":
+            scale = 1.0
+        y, err = values[key]
+        return np.column_stack(
+            (
+                self.r0_centers_nm,
+                np.where(self.n_origins >= nmin, y * scale, np.nan),
+                np.where(self.n_origins >= nmin, err * scale, np.nan),
+                self.n_origins,
+                self.hit_fraction,
+            )
+        )
+
+    def survival_curve(self, r0_nm: float, *, time_unit: str = "ns") -> np.ndarray:
+        """Return (lag, P(T > lag)) for the initial-distance bin containing r0.
+
+        This empirical survival curve uses the fixed set of eligible origins,
+        includes nonhits in its denominator, and stops at the observed horizon.
+        Use a steps-post plot. At an exact event lag, that event is counted as a
+        hit; a nonhit remains in the survival probability at the horizon.
+        """
+        r0 = float(r0_nm)
+        edges = self.r_edges_nm
+        if not np.isfinite(r0) or not edges[0] <= r0 <= edges[-1]:
+            raise ValueError("r0_nm is outside the initial-distance bins")
+        index = min(len(edges) - 2, int(np.searchsorted(edges, r0, side="right") - 1))
+        n = int(self.n_origins[index])
+        if n == 0:
+            raise ValueError(f"no eligible origins in the bin containing {r0:g} nm")
+        times, counts = np.unique(self.completed_steps_by_bin[index], return_counts=True)
+        steps = np.unique(np.r_[0, times, self.horizon_frames]).astype(np.int64)
+        cum = np.r_[0, np.cumsum(counts, dtype=np.int64)]
+        survived = 1.0 - cum[np.searchsorted(times, steps, side="right")] / n
+        scale, _ = _time_scale_from_ns(time_unit)
+        return np.column_stack((steps * self.physical_dt_ns * scale, survived))
+
+
+def _fpt_sources(data: Any, prop: str, path: str = "data") -> list[tuple[str, Any]]:
+    """Find distance leaves without joining different trajectories in time."""
+    if _result_has_field(data, prop) or isinstance(data, np.ndarray):
+        return [(path, data)]
+    if isinstance(data, Mapping):
+        if not data:
+            raise ValueError(f"{path}: empty data mapping")
+        output = []
+        for key, value in data.items():
+            name = str(key) if path == "data" else f"{path}/{key}"
+            output.extend(_fpt_sources(value, prop, name))
+        return output
+    if isinstance(data, (list, tuple)):
+        if not data:
+            raise ValueError(f"{path}: empty data sequence")
+        # A regular numeric array is one trajectory set. Otherwise a sequence
+        # of trajectory results/arrays may be pooled as separate sources.
+        try:
+            array = np.asarray(data, dtype=float)
+        except (TypeError, ValueError):
+            array = None
+        if array is not None and array.ndim in (1, 2):
+            return [(path, array)]
+        output = []
+        for index, value in enumerate(data):
+            output.extend(_fpt_sources(value, prop, f"{path}/{index}"))
+        return output
+    raise TypeError(f"{path}: expected a distance result, 1D/2D array, or collection of results")
+
+
+def _fpt_selection_for_source(selection: Any, key: str, name: str) -> Any:
+    if isinstance(selection, Mapping):
+        if key not in selection:
+            raise KeyError(f"{name} has no entry for {key!r}")
+        return selection[key]
+    return selection
+
+
+def _fpt_divide(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
+    return np.divide(
+        numerator,
+        denominator,
+        out=np.full(denominator.shape, np.nan, dtype=float),
+        where=denominator > 0,
+    )
+
+
+def _fpt_jackknife(sums: np.ndarray, counts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Delete one contributing cluster at a time, preserving pooled weighting."""
+    error = np.full(counts.shape[1], np.nan, dtype=float)
+    n_contributing = np.sum(counts > 0, axis=0, dtype=np.int64)
+    for j, n in enumerate(n_contributing):
+        if n < 2:
+            continue
+        use = counts[:, j] > 0
+        c = counts[use, j]
+        s = sums[use, j]
+        loo = (s.sum() - s) / (c.sum() - c)
+        error[j] = np.sqrt((n - 1.0) / n * np.sum((loo - loo.mean()) ** 2))
+    return error, n_contributing
+
+
+def calculate_first_passage_times(
+    data: Any,
+    delta_t: Any,
+    *,
+    target_nm: float = 0.5,
+    distance_field: str = "distance_per_chain_nm",
+    bins: Union[int, Sequence[float], np.ndarray] = 15,
+    value_range: Optional[tuple[float, float]] = None,
+    max_lag_ns: Any = None,
+    kinetic_scale: float = 1.0,
+    include_chains: Any = None,
+    exclude_chains: Any = None,
+    chain_indices: Any = None,
+    strict_chain_selection: bool = True,
+    mintime: Any = None,
+    maxtime: Any = None,
+    time_start: Any = None,
+    time_stop: Any = None,
+    frame_start: Optional[int] = None,
+    frame_stop: Optional[int] = None,
+    origin_stride: int = 1,
+    origin_mode: str = "all",
+    target_inclusive: bool = False,
+    uncertainty: str = "auto",
+) -> FirstPassageResult:
+    """Pooled distance-conditioned first passage to r < target_nm (sampled frames).
+
+    ``data`` is one cached distance result, one 1D/2D numeric array, a flat or
+    nested mapping of results (e.g. mincontact[p]), or a collection of results.
+    Each row is a separate time series; neither chains nor sets are joined in
+    time. All origins across all leaves are pooled with equal origin weight.
+    All leaves must have the same stored-frame spacing ``delta_t`` (raw ns or
+    OpenMM time Quantity). Named/positional selections may be global or a
+    mapping keyed by dataset name (slash-separated paths for nested mappings).
+    Unknown named chains raise unless strict_chain_selection=False. Interchain
+    minimum-contact input selects reference rows, not their target-chain pool.
+
+    ``mintime``/``maxtime`` (aliases time_start/time_stop) specify the raw,
+    unscaled trajectory time interval [min,max); frame limits are alternatives.
+    Only passages within the selected interval are considered. ``kinetic_scale``
+    multiplies lag times after selection, and ``max_lag_ns`` is the requested
+    PHYSICAL follow-up horizon (ns or time Quantity), rounded down to a stored
+    frame interval. If omitted, use half the shortest selected trajectory span.
+    Use an explicit common physical horizon when comparing systems.
+
+    Origins are all sampled frames outside the target in the requested initial
+    distance bins, with ``origin_stride`` applied to the sliced frame grid.
+    ``origin_mode='entry'`` instead uses observed entrances into each distance
+    bin from a different bin/outside the bin; the first frame after a missing
+    interval is not an observed entry. This estimates a different ensemble.
+    The trajectory is free to leave the initial bin or move farther away before
+    hitting the target. The first observed r < target_nm (or <= if requested)
+    ends a passage. Crossings between saved frames are not interpolated.
+    Integer bins use value_range (default target_nm to 8 nm); explicit edges
+    override value_range. Frames already in the target are not eligible origins.
+
+    Each origin must have a complete, contiguous horizon, irrespective of
+    whether a hit occurs early. NaN/inf distances break continuity; negative
+    finite distances are rejected. All nonhits contribute horizon to the
+    restricted mean E[min(T,horizon)], and count as right-censored. No waiting
+    time beyond the horizon is invented. The unrestricted sample mean is NaN
+    if any origins in a bin do not reach the target. A completed-only mean is
+    available separately for diagnostic use (biased toward fast passages).
+
+    Uncertainty uses a pooled delete-one-cluster jackknife: 'auto' uses separate
+    input leaves as set replicates if multiple leaves, otherwise chain rows;
+    'chain', 'set', or 'none' can be selected explicitly. Use independent sets
+    where possible; correlated chains in a condensate need not be independent
+    replicates. An error is NaN with fewer than two contributing clusters.
+    This does not estimate uncertainty in unobserved tails.
+    """
+    dt = _delta_t_to_ns(delta_t)
+    scale = float(kinetic_scale)
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("kinetic_scale must be finite and > 0")
+    physical_dt = dt * scale
+    if not np.isfinite(physical_dt) or physical_dt <= 0:
+        raise ValueError("scaled frame spacing must be finite and > 0")
+    target = float(target_nm)
+    if not np.isfinite(target) or target <= 0:
+        raise ValueError("target_nm must be finite and > 0")
+    stride = _frame_index(origin_stride, name="origin_stride")
+    if stride < 1:
+        raise ValueError("origin_stride must be >= 1")
+    mode = str(origin_mode).strip().lower()
+    if mode not in {"all", "entry"}:
+        raise ValueError("origin_mode must be 'all' or 'entry'")
+    if not isinstance(strict_chain_selection, (bool, np.bool_)):
+        raise TypeError("strict_chain_selection must be boolean")
+    if include_chains is not None and exclude_chains is not None:
+        raise ValueError("include_chains and exclude_chains are mutually exclusive")
+    if (
+        mintime is not None
+        and time_start is not None
+        or maxtime is not None
+        and time_stop is not None
+    ):
+        raise ValueError("use mintime/maxtime or time_start/time_stop, not both for the same limit")
+    t0 = mintime if time_start is None else time_start
+    t1 = maxtime if time_stop is None else time_stop
+    if np.isscalar(bins):
+        n_bins = _frame_index(bins, name="bins")
+        if n_bins < 1:
+            raise ValueError("bins must be >= 1")
+        limits = (target, 8.0) if value_range is None else value_range
+        if len(limits) != 2:
+            raise ValueError("value_range must be (min,max)")
+        lo, hi = map(float, limits)
+        if not np.isfinite(lo) or not np.isfinite(hi) or lo < 0 or hi <= lo:
+            raise ValueError("value_range must be finite, nonnegative and increasing")
+        edges = np.linspace(lo, hi, n_bins + 1)
+    else:
+        edges = np.asarray(bins, dtype=float).copy()
+        if (
+            edges.ndim != 1
+            or edges.size < 2
+            or not np.all(np.isfinite(edges))
+            or edges[0] < 0
+            or np.any(np.diff(edges) <= 0)
+        ):
+            raise ValueError("bins must be finite, increasing nonnegative edges")
+        n_bins = edges.size - 1
+    if edges[-1] <= target:
+        raise ValueError("initial distance bins must extend above the target")
+
+    sources = _fpt_sources(data, distance_field)
+    if len({name for name, _ in sources}) != len(sources):
+        raise ValueError("duplicate flattened dataset labels")
+    selected = []
+    for name, source in sources:
+        array = np.asarray(
+            _result_field(source, distance_field)
+            if _result_has_field(source, distance_field)
+            else source
+        )
+        if array.ndim == 1:
+            array = array[None, :]
+        if array.ndim != 2 or array.shape[0] == 0 or array.shape[1] < 2:
+            raise ValueError(f"{name!r}: expected one or more distance rows with >=2 frames")
+        labeled = _result_has_field(source, "chain_labels")
+        labels = (
+            tuple(str(x) for x in _result_field(source, "chain_labels"))
+            if labeled
+            else tuple(f"chain {i}" for i in range(array.shape[0]))
+        )
+        if len(labels) != array.shape[0] or len(set(labels)) != len(labels):
+            raise ValueError(f"{name!r}: invalid or duplicate chain_labels")
+        indices = _hist2d_chain_selection(
+            labels,
+            chain_indices=_fpt_selection_for_source(chain_indices, name, "chain_indices"),
+            include_chains=_fpt_selection_for_source(include_chains, name, "include_chains"),
+            exclude_chains=_fpt_selection_for_source(exclude_chains, name, "exclude_chains"),
+            strict_chain_selection=strict_chain_selection,
+            labeled=labeled,
+        )
+        if indices.size == 0:
+            raise ValueError(f"{name!r}: chain selection leaves no chains")
+        start, stop = _resolve_frame_slice(
+            array.shape[1],
+            frame_start=frame_start,
+            frame_stop=frame_stop,
+            time_start=t0,
+            time_stop=t1,
+            delta_t=dt,
+        )
+        if stop - start < 2:
+            raise ValueError(f"{name!r}: selected window must contain at least two frames")
+        selected.append((name, array, labels, indices, start, stop))
+
+    requested = None if max_lag_ns is None else _time_value_to_ns(max_lag_ns, name="max_lag_ns")
+    if requested is None:
+        hframes = max(1, min(stop - start - 1 for _, _, _, _, start, stop in selected) // 2)
+    else:
+        if requested <= 0:
+            raise ValueError("max_lag_ns must be > 0")
+        ratio = requested / physical_dt
+        hframes = int(math.floor(ratio + 16 * np.finfo(float).eps * max(1.0, ratio)))
+    if hframes < 1:
+        raise ValueError("max_lag_ns is smaller than one physical frame interval")
+    horizon = hframes * physical_dt
+    too_short = [name for name, _, _, _, start, stop in selected if stop - start - 1 < hframes]
+    if too_short:
+        raise ValueError(
+            f"max_lag_ns exceeds the selected trajectory span for {too_short}; "
+            "choose a common shorter physical horizon"
+        )
+
+    unc = str(uncertainty).strip().lower()
+    if unc == "auto":
+        unc = "set" if len(selected) > 1 else "chain"
+    if unc not in {"chain", "set", "none"}:
+        raise ValueError("uncertainty must be 'auto', 'chain', 'set', or 'none'")
+    n_rows = sum(len(indices) for _, _, _, indices, _, _ in selected)
+    shape = (n_rows, n_bins)
+    candidates = np.zeros(shape, dtype=np.int64)
+    origins = np.zeros(shape, dtype=np.int64)
+    hits = np.zeros(shape, dtype=np.int64)
+    hit_steps_sum = np.zeros(shape, dtype=float)
+    r0_sum = np.zeros(shape, dtype=float)
+    events: list[list[np.ndarray]] = [[] for _ in range(n_bins)]
+    chain_labels = []
+    chain_sources = []
+    source_indices = []
+    row_index = 0
+    invalid_count = 0
+    for source_i, (name, array, labels, indices, start, stop) in enumerate(selected):
+        for chain_i in indices:
+            chain_labels.append(labels[int(chain_i)])
+            chain_sources.append(name)
+            source_indices.append(source_i)
+            r = np.asarray(array[int(chain_i), start:stop], dtype=float)
+            finite = np.isfinite(r)
+            if np.any(r[finite] < 0):
+                raise ValueError(f"{name!r}/{labels[int(chain_i)]}: negative distance")
+            invalid_count += int(np.sum(~finite))
+            boundaries = np.flatnonzero(np.diff(np.r_[False, finite, False].astype(np.int8)))
+            for left, right in zip(boundaries[::2], boundaries[1::2]):
+                x = r[left:right]
+                n = x.size
+                grid = np.arange(n, dtype=np.int64)
+                target_mask = x <= target if target_inclusive else x < target
+                b = np.searchsorted(edges, x, side="right") - 1
+                b[x == edges[-1]] = n_bins - 1
+                valid = (~target_mask) & (b >= 0) & (b < n_bins) & ((grid + left) % stride == 0)
+                if mode == "entry":
+                    entry = np.r_[False, b[1:] != b[:-1]]
+                    # A target sample may be in the same initial-distance bin.
+                    entry[1:] |= target_mask[:-1] & (~target_mask[1:])
+                    valid &= entry
+                candidates[row_index] += np.bincount(b[valid], minlength=n_bins)
+                eligible = valid & (grid + hframes < n)
+                if not np.any(eligible):
+                    continue
+                ii = grid[eligible]
+                bb = b[eligible]
+                # Backward cumulative minimum locates the next observed hit
+                # in O(n_frames), not a separate search over each future path.
+                next_hit = np.minimum.accumulate(np.where(target_mask, grid, n)[::-1])[::-1]
+                passage = next_hit[ii] - ii
+                reached = (next_hit[ii] < n) & (passage <= hframes)
+                origins[row_index] += np.bincount(bb, minlength=n_bins)
+                r0_sum[row_index] += np.bincount(bb, weights=x[ii], minlength=n_bins)
+                hits[row_index] += np.bincount(bb[reached], minlength=n_bins)
+                hit_steps_sum[row_index] += np.bincount(
+                    bb[reached], weights=passage[reached], minlength=n_bins
+                )
+                for j in np.unique(bb[reached]):
+                    events[int(j)].append(passage[reached & (bb == j)].copy())
+            row_index += 1
+
+    n_origins = origins.sum(axis=0)
+    n_hits = hits.sum(axis=0)
+    if not np.any(n_origins):
+        raise ValueError(
+            "no eligible origins: check distance bins, selected chains, and follow-up horizon"
+        )
+    n_censored = n_origins - n_hits
+    hit_sum_ns = hit_steps_sum * physical_dt
+    rmst_sum_ns = (hit_steps_sum + (origins - hits) * hframes) * physical_dt
+    restricted = _fpt_divide(rmst_sum_ns.sum(axis=0), n_origins)
+    completed = _fpt_divide(hit_sum_ns.sum(axis=0), n_hits)
+    fraction = _fpt_divide(n_hits, n_origins)
+    mean_fpt = np.where(n_censored == 0, completed, np.nan)
+    group_origins, group_hits, group_rmst, group_completed = origins, hits, rmst_sum_ns, hit_sum_ns
+    if unc == "set":
+        sid = np.asarray(source_indices)
+        group_origins = np.stack([origins[sid == j].sum(axis=0) for j in range(len(selected))])
+        group_hits = np.stack([hits[sid == j].sum(axis=0) for j in range(len(selected))])
+        group_rmst = np.stack([rmst_sum_ns[sid == j].sum(axis=0) for j in range(len(selected))])
+        group_completed = np.stack([hit_sum_ns[sid == j].sum(axis=0) for j in range(len(selected))])
+    if unc == "none":
+        rmst_se = completed_se = fraction_se = np.full(n_bins, np.nan)
+        n_clusters = n_hit_clusters = np.zeros(n_bins, dtype=np.int64)
+    else:
+        rmst_se, n_clusters = _fpt_jackknife(group_rmst, group_origins)
+        completed_se, n_hit_clusters = _fpt_jackknife(group_completed, group_hits)
+        fraction_se, _ = _fpt_jackknife(group_hits, group_origins)
+
+    notes = [
+        "Pooled by eligible time origin, not by episode or chain mean.",
+        "Nonhits are censored at the common horizon; restricted mean is a lower bound on the population MFPT, not an extrapolated tail.",
+        "Passages are to a target observed at saved frames; no between-frame crossing interpolation.",
+    ]
+    if requested is None:
+        notes.append(
+            "Horizon chosen automatically as half the shortest selected span; specify max_lag_ns for comparisons."
+        )
+    elif not math.isclose(horizon, requested, rel_tol=1e-12, abs_tol=1e-12):
+        notes.append(f"Requested horizon {requested:g} ns rounded down to {horizon:g} ns.")
+    if invalid_count:
+        notes.append(
+            f"{invalid_count} nonfinite frames break continuity; incomplete follow-up origins excluded even if an early hit was observed."
+        )
+    absent_sources = [
+        name
+        for name in dict.fromkeys(chain_sources)
+        if not np.any(origins[np.asarray(chain_sources) == name])
+    ]
+    if absent_sources:
+        notes.append(f"No eligible origins in sources {absent_sources}.")
+        warnings.warn(notes[-1], RuntimeWarning, stacklevel=2)
+    if unc != "none":
+        notes.append(
+            f"Jackknife errors across {unc} clusters; overlapping origins and correlated chains are not independent replicates."
+        )
+    return FirstPassageResult(
+        r_edges_nm=edges,
+        r0_mean_nm=_fpt_divide(r0_sum.sum(axis=0), n_origins),
+        target_nm=target,
+        target_inclusive=bool(target_inclusive),
+        delta_t_ns=dt,
+        kinetic_scale=scale,
+        physical_dt_ns=physical_dt,
+        horizon_ns=horizon,
+        horizon_frames=hframes,
+        requested_horizon_ns=requested,
+        origin_stride=stride,
+        origin_mode=mode,
+        n_candidate_origins=candidates.sum(axis=0),
+        n_origins=n_origins,
+        n_hits=n_hits,
+        n_censored=n_censored,
+        hit_fraction=fraction,
+        hit_fraction_stderr=fraction_se,
+        restricted_mean_ns=restricted,
+        restricted_stderr_ns=rmst_se,
+        mean_completed_ns=completed,
+        completed_stderr_ns=completed_se,
+        mean_fpt_ns=mean_fpt,
+        mean_fpt_stderr_ns=np.where(n_censored == 0, rmst_se, np.nan),
+        completed_steps_by_bin=tuple(
+            np.concatenate(v) if v else np.empty(0, dtype=np.int64) for v in events
+        ),
+        source_labels=tuple(item[0] for item in selected),
+        chain_labels=tuple(chain_labels),
+        chain_source_labels=tuple(chain_sources),
+        frame_slices=tuple((item[4], item[5]) for item in selected),
+        n_origins_per_chain=origins,
+        n_hits_per_chain=hits,
+        restricted_mean_per_chain_ns=_fpt_divide(rmst_sum_ns, origins),
+        uncertainty=unc,
+        n_clusters_per_bin=n_clusters,
+        n_hit_clusters_per_bin=n_hit_clusters,
+        notes=tuple(notes),
+    )
+
+
+def plot_first_passage_times(
+    results: Any,
+    *,
+    statistic: str = "restricted_mean",
+    time_unit: str = "us",
+    min_origins: int = 1,
+    show_uncertainty: bool = True,
+    **plot_kwargs: Any,
+) -> tuple[plt.Figure, plt.Axes]:
+    """Plot a FirstPassageResult or label -> result mapping using plot_errorbar_datasets.
+
+    All plot_errorbar_datasets styling options (colors, labels, connect,
+    fill_uncertainty, reference_values, xlim, ylim, yscale, save_path, etc.)
+    are forwarded. Time conversion applies to y and errors, not x distances.
+    For a fair restricted-mean comparison use the same physical horizon and
+    target for all curves unless intentionally comparing different targets.
+    If any plotted finite estimate lacks a jackknife error, all curves are
+    plotted without error bars (with a warning); no zero error is invented.
+    Use show_uncertainty=False for explicit points-only comparisons.
+    """
+    mapping = results if isinstance(results, Mapping) else {"data": results}
+    if not mapping:
+        raise ValueError("results mapping is empty")
+    datasets = {
+        str(key): result.as_errorbar_dataset(
+            statistic=statistic, time_unit=time_unit, min_origins=min_origins
+        )
+        for key, result in mapping.items()
+    }
+    if str(statistic).lower() in {"restricted_mean", "rmst", "hit_fraction"}:
+        horizons = [float(result.horizon_ns) for result in mapping.values()]
+        if not np.allclose(horizons, horizons[0], rtol=1e-10, atol=1e-10):
+            warnings.warn(
+                "Comparing different physical follow-up horizons; restricted means and hit fractions depend on horizon.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    key = str(statistic).strip().lower()
+    _, label = _time_scale_from_ns(time_unit)
+    ylabels = {
+        "restricted_mean": f"Restricted mean first-passage time ({label})",
+        "rmst": f"Restricted mean first-passage time ({label})",
+        "mean_fpt": f"Mean first-passage time ({label})",
+        "mean_completed": f"Mean completed passage time ({label})",
+        "hit_fraction": "Fraction reaching target",
+    }
+    if show_uncertainty and any(
+        np.any(np.isfinite(v[:, 1]) & ~np.isfinite(v[:, 2])) for v in datasets.values()
+    ):
+        warnings.warn(
+            "Some finite estimates have unresolved jackknife errors; plotting all curves without error bars."
+            " Inspect .restricted_stderr_ns or .as_errorbar_dataset() for available errors.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        show_uncertainty = False
+    if not show_uncertainty and plot_kwargs.get("fill_uncertainty", False):
+        raise ValueError("fill_uncertainty requires resolved errors and show_uncertainty=True")
+    plot_kwargs.setdefault("xlabel", "Initial distance (nm)")
+    plot_kwargs.setdefault("ylabel", ylabels[key])
+    plot_kwargs.setdefault("connect", True)
+    plot_kwargs.setdefault("yerr_col", 2 if show_uncertainty else None)
+    # An entirely unobserved curve is not a zero curve. Omit it explicitly.
+    skipped = [name for name, arr in datasets.items() if not np.any(np.isfinite(arr[:, 1]))]
+    if skipped:
+        warnings.warn(
+            f"No finite {statistic} estimates to plot for {skipped}", RuntimeWarning, stacklevel=2
+        )
+        datasets = {name: arr for name, arr in datasets.items() if name not in skipped}
+    if not datasets:
+        raise ValueError("no finite first-passage estimates to plot")
+    return plot_errorbar_datasets(datasets, **plot_kwargs)
